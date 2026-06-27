@@ -1,0 +1,21 @@
+{
+  "name": "court-booking-bot",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Playwright E2E booking bot for susport.sc.su.ac.th (9 parallel accounts, 12:00:00 trigger)",
+  "scripts": {
+    "start": "ts-node src/scheduler.ts",
+    "now": "ts-node src/scheduler.ts --now",
+    "dry-run": "ts-node src/scheduler.ts --now --dry-run",
+    "account": "ts-node src/scheduler.ts --now --account",
+    "discover": "ts-node src/discoverSlots.ts"
+  },
+  "dependencies": {
+    "playwright": "^1.49.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.7.2"
+  }
+}

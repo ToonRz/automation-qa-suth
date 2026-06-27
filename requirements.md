@@ -12,19 +12,21 @@
 
 ## 2. Credentials & Time Assignment
 
-| # | Username | Password | เวลาที่จอง (slot) |
-|---|----------|----------|-------------------|
-| 1 | 650910088 | Pin@2546 | TBD |
-| 2 | 671211370 | 123456789guy | TBD |
-| 3 | 670910322 | 320032Za | TBD |
-| 4 | 671211270 | 123456789eye | TBD |
-| 5 | 670911373 | Pt18102548 | TBD |
-| 6 | 670910478 | 1104200499085 | TBD |
-| 7 | 670910321 | 0877048019Vv | TBD |
-| 8 | 670910300 | Jameth2442! | TBD |
-| 9 | 670910323 | Jj071047 | TBD |
+| # | Username    | Password    | เวลาที่จอง (slot) |
+|---|-------------|-------------|-------------------|
+| 1 | `<username>`| `<password>`| TBD               |
+| 2 | `<username>`| `<password>`| TBD               |
+| 3 | `<username>`| `<password>`| TBD               |
+| 4 | `<username>`| `<password>`| TBD               |
+| 5 | `<username>`| `<password>`| TBD               |
+| 6 | `<username>`| `<password>`| TBD               |
+| 7 | `<username>`| `<password>`| TBD               |
+| 8 | `<username>`| `<password>`| TBD               |
+| 9 | `<username>`| `<password>`| TBD               |
 
 > **หมายเหตุ:** คอลัมน์ "เวลาที่จอง" ต้องระบุก่อน implement — แต่ละ account จะได้ slot เวลาที่ต่างกัน
+>
+> **Security:** credentials จริงเก็บใน `config/accounts.json` เท่านั้น (ไฟล์นี้ใช้ placeholders สำหรับ public spec)
 
 ---
 
@@ -66,16 +68,27 @@
 10. context.close()
 ```
 
-### 3.4 Court Selection Logic
+### 3.4 Court Selection Logic — Retry-with-Fallback
 
 ```
-PRIMARY   → แบดมินตัน1
-FALLBACK  → แบดมินตัน4
-ABORT     → ถ้าทั้ง 2 ไม่ว่าง: status = FAIL, reason = "ทั้ง 2 สนามเต็ม"
+PRIMARY     → แบดมินตัน1
+FALLBACK    → แบดมินตัน4
+EXTENDED    → แบดมินตันอื่นๆ ที่ dropdown มี (แบดมินตัน2, 3, 5, 6, …) — ยกเว้นเทนนิส
+ABORT       → ไม่เจอ (court, slot) ใดว่างภายใน 30s: status = FAIL
 ```
 
-- ห้ามเลือกสนามอื่นนอกจาก 2 ตัวนี้
-- ลำดับ fallback ต้องเป็น 1 → 4 เสมอ (ไม่สลับ)
+**Slot priority (ต่อ 1 court):** assigned slot ก่อน → slot อื่นที่ dropdown มีให้
+
+**Retry budget:** สูงสุด **30 วินาที** ต่อ account (เริ่มนับหลัง login เสร็จ) — ถ้าเกินจะหยุด loop และบันทึก FAIL
+
+**Exit conditions (หยุด loop ทันที):**
+- ✅ `success` → PASS
+- 🚫 `already-booked-today` (server ตอบว่า "คุณได้จองสนามวันนี้แล้ว") → FAIL
+- ⏰ deadline หมด → FAIL
+
+**Special case:** ถ้า submit fail แล้ว server redirect ออกจาก `booking.php` ต้อง `goto(booking.php)` ก่อน retry (handled in `resetToBookingPage()`)
+
+> **หมายเหตุ:** พฤติกรรมนี้ขยายจาก spec เดิม (ที่ระบุ ABORT = ทั้ง 2 เต็ม) — เพิ่ม EXTENDED layer เพื่อเพิ่มโอกาสสำเร็จ และรองรับกรณีที่สนามอื่นยังมี slot ว่าง
 
 ---
 
@@ -115,15 +128,15 @@ court-booking-bot/
 
 ```json
 [
-  { "username": "650910088", "password": "Pin@2546",        "slot": "TBD" },
-  { "username": "671211370", "password": "123456789guy",    "slot": "TBD" },
-  { "username": "670910322", "password": "320032Za",        "slot": "TBD" },
-  { "username": "671211270", "password": "123456789eye",    "slot": "TBD" },
-  { "username": "670911373", "password": "Pt18102548",      "slot": "TBD" },
-  { "username": "670910478", "password": "1104200499085",   "slot": "TBD" },
-  { "username": "670910321", "password": "0877048019Vv",    "slot": "TBD" },
-  { "username": "670910300", "password": "Jameth2442!",     "slot": "TBD" },
-  { "username": "670910323", "password": "Jj071047",        "slot": "TBD" }
+  { "username": "<username>", "password": "<password>", "slot": "TBD" },
+  { "username": "<username>", "password": "<password>", "slot": "TBD" },
+  { "username": "<username>", "password": "<password>", "slot": "TBD" },
+  { "username": "<username>", "password": "<password>", "slot": "TBD" },
+  { "username": "<username>", "password": "<password>", "slot": "TBD" },
+  { "username": "<username>", "password": "<password>", "slot": "TBD" },
+  { "username": "<username>", "password": "<password>", "slot": "TBD" },
+  { "username": "<username>", "password": "<password>", "slot": "TBD" },
+  { "username": "<username>", "password": "<password>", "slot": "TBD" }
 ]
 ```
 
