@@ -564,6 +564,78 @@ interface ScheduledRun {
   mode: 'prewarm' | 'standard';
 }
 
+/** DM the owner that the pre-warm window has opened. Fire-and-forget —
+ *  failure is logged but must never block the booking run or crash the bot
+ *  process.
+ *  Per user spec: sent to the owner only (role='owner'), never to friends.
+ *
+ *  Times and lead duration in the message are derived from `fireTime` (the
+ *  planned noon tick) and `cronFireAt` (the actual cron-fire time), so the
+ *  message stays accurate if the cron expression in main() changes. */
+async function sendPrewarmNoticeToOwner(
+  fireTime: Date,
+  cronFireAt: Date
+): Promise<void> {
+  // Whole body inside try — anything that throws synchronously (malformed
+  // users.json → getOwner() throws SyntaxError, etc.) must not become an
+  // unhandled rejection, since the caller uses `void` (fire-and-forget).
+  try {
+    const owner = getOwner();
+    if (!owner) {
+      console.log('[cron] no owner registered — skipping prewarm notice');
+      return;
+    }
+    if (owner.accounts.length === 0) {
+      // Skip — booking loop below won't run for an owner with no accounts,
+      // so sending "จะจองตอน ..." would be a misleading promise.
+      console.log(`[cron] owner ${owner.display_name} has 0 accounts — skipping prewarm notice`);
+      return;
+    }
+
+    // Group accounts by court, then sort each group by slot for stable display.
+    const byCourt = new Map<string, typeof owner.accounts>();
+    for (const acc of owner.accounts) {
+      const list = byCourt.get(acc.court) ?? [];
+      list.push(acc);
+      byCourt.set(acc.court, list);
+    }
+    for (const list of byCourt.values()) {
+      list.sort((a, b) => a.slot.localeCompare(b.slot));
+    }
+
+    const fmtTime = (d: Date): string => d.toTimeString().slice(0, 8);
+    const fmtSlot = (s: string): string => s.replace('_', '-');
+    const leadMin = Math.round(
+      (fireTime.getTime() - cronFireAt.getTime()) / 60_000
+    );
+
+    const lines: string[] = [];
+    lines.push(`⏰ ตื่นแล้ว! Pre-warm เริ่ม ${fmtTime(cronFireAt)}`);
+    lines.push(`━━━━━━━━━━━━━━━━━━`);
+    lines.push('');
+    lines.push(`📅 จะจองตอน ${fmtTime(fireTime)} น.`);
+    lines.push(`👤 ${owner.display_name} · ${owner.accounts.length} accounts`);
+    lines.push(`⏳ เหลืออีก ${leadMin} นาที`);
+    lines.push('');
+    lines.push(`🎯 แผนจอง:`);
+    for (const [court, accounts] of byCourt) {
+      lines.push(`   🏸 ${court} (${accounts.length} คิว)`);
+      for (const acc of accounts) {
+        lines.push(`      • ${acc.username} · ${fmtSlot(acc.slot)}`);
+      }
+    }
+    lines.push('');
+    lines.push(`━━━━━━━━━━━━━━━━━━`);
+    lines.push(`🛠  [Login → เลือก court → เลือก slot → ยืนยัน]`);
+    const text = lines.join('\n');
+
+    await sendTelegramMessage(owner.chat_id, text);
+    console.log(`[cron] prewarm notice sent to owner (${owner.display_name})`);
+  } catch (err) {
+    console.warn(`[cron] prewarm notice failed: ${err}`);
+  }
+}
+
 async function runScheduledBooking(): Promise<void> {
   // Cron fires at 11:55 (5-min lead) so runWithDeepPrewarm has time to login +
   // pre-select court/slot before the noon tick. fireTime is the PLANNED noon,
@@ -576,6 +648,16 @@ async function runScheduledBooking(): Promise<void> {
       `firing at ${fireTime.toISOString()} ` +
       `(prewarm window opens at ${new Date(fireTime.getTime() - 5 * 60_000).toISOString()})`
   );
+
+  // Notify the owner that the pre-warm window has opened. Fire-and-forget:
+  // we don't await this in the main path because the booking work should
+  // start immediately. The helper internally logs and swallows ALL errors
+  // (sync throws from getOwner() AND async throws from sendTelegramMessage)
+  // so this can never become an unhandled rejection.
+  // `new Date()` is the actual cron-fire moment, used by the helper to derive
+  // the lead duration in the message — keeps the message accurate even if the
+  // cron expression in main() changes.
+  void sendPrewarmNoticeToOwner(fireTime, new Date());
 
   // Collect: owner always runs at noon. Friends run only if they sent /book.
   const owner = getOwner();
