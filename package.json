@@ -2,19 +2,24 @@
   "name": "court-booking-bot",
   "version": "0.1.0",
   "private": true,
-  "description": "Playwright E2E booking bot for susport.sc.su.ac.th (9 parallel accounts, 12:00:00 trigger)",
+  "description": "Playwright E2E booking bot for susport.sc.su.ac.th (9 parallel accounts, 12:00:00 trigger). Telegram bot interface for multi-user.",
   "scripts": {
     "start": "ts-node src/scheduler.ts",
     "now": "ts-node src/scheduler.ts --now",
     "dry-run": "ts-node src/scheduler.ts --now --dry-run",
     "account": "ts-node src/scheduler.ts --now --account",
-    "discover": "ts-node src/discoverSlots.ts"
+    "discover": "ts-node src/discoverSlots.ts",
+    "bot": "NODE_OPTIONS=--dns-result-order=ipv4first ts-node src/server/bot.ts"
   },
   "dependencies": {
-    "playwright": "^1.49.1"
+    "dotenv": "^16.4.7",
+    "node-cron": "^3.0.3",
+    "playwright": "^1.49.1",
+    "telegraf": "^4.16.3"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
+    "@types/node-cron": "^3.0.11",
     "ts-node": "^10.9.2",
     "typescript": "^5.7.2"
   }

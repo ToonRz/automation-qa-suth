@@ -1,0 +1,24 @@
+{
+  "users": [
+    {
+      "telegram_id": 123456789,
+      "chat_id": 123456789,
+      "display_name": "ณราวิชญ์ (Owner)",
+      "role": "owner",
+      "accounts": [
+        { "username": "650910088", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "17:00_18:00" },
+        { "username": "671211370", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "18:00_19:00" },
+        { "username": "670910322", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "19:00_20:00" }
+      ]
+    },
+    {
+      "telegram_id": 987654321,
+      "chat_id": 987654321,
+      "display_name": "เพื่อน A",
+      "role": "friend",
+      "accounts": [
+        { "username": "671211170", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "20:00_21:00" }
+      ]
+    }
+  ]
+}

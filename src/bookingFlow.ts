@@ -3,21 +3,21 @@
 //
 // Performance: 6 badminton courts are queried in PARALLEL via fetch() in the page
 // context (~500ms) instead of sequentially via selectOption + AJAX wait (~2.7s).
-// This drops per-account cost from ~2.7s to ~1s for the all-empty path.
+// Parallel fetch returns BOTH the per-court availability filter AND the per-court
+// slot list (computed as ALL_SLOTS − reserved), so we skip the redundant dropdown
+// read that the page's onchange handler would force us into. Combined with short
+// (3s) timeouts on selectOption/submit, this drops per-account cost to ~2-3s even
+// when falling back to multiple courts.
 //
 // Flow:
 //   1. Login (fresh BrowserContext per call — BR-01/02)
 //   2. Parallel-fetch reserved times for all 6 badminton courts in one page.evaluate
-//      (must include `date` — server returns [] without it, see fetchAllReservedTimes)
-//   3. Use parallel fetch as a BINARY HINT — which courts *might* have available slots
+//      (must include `date` — server returns [] without it)
+//   3. Compute available slots per court from parallel-fetch data
 //   4. Iterate priority queue: assigned court → fallback → other badminton
-//   5. For each "maybe-available" court: re-select court to refresh #time dropdown,
-//      READ the dropdown (source of truth), then submit slot
+//   5. For each "has-slots" court: selectOption(court) → selectOption(slot) → submit
+//      (race-loss with another parallel account is caught by short timeout)
 //   6. Bail out on success / "already booked today" / 30s deadline
-//
-// Source of truth: the page's #time dropdown after selectOption(court). It applies
-// time-of-day / date filters the parallel fetch can't see. We use the dropdown for
-// the actual slot list, parallel fetch only for "skip fully-booked courts fast".
 //
 // Spec note: this extends requirements §3.4 (originally PRIMARY=1, FALLBACK=4, ABORT=both
 // full) with an EXTENDED layer that walks other badminton courts. Approved by user.
@@ -59,6 +59,16 @@ export interface FlowOptions {
   screenshotsDir?: string; // override default screenshot directory
   browser?: Browser;       // reuse an existing browser (single launch across N contexts)
   retryDeadlineMs?: number;// override 30s retry budget (for tests)
+  /**
+   * A page that has ALREADY been navigated to login.php and had username/password
+   * filled in but NOT submitted. Used by the pre-warm optimization: open N contexts
+   * + fill forms during the countdown, then click submit on all N in the same tick
+   * to shave ~500-1000ms off the noon race.
+   *
+   * When provided: the function reuses the existing page/context and only clicks
+   * submit. When omitted: standard navigate + fill + submit.
+   */
+  prewarmedLoginPage?: Page;
 }
 
 const LOGIN_URL = 'https://susport.sc.su.ac.th/login.php';
@@ -79,14 +89,28 @@ const ALL_SLOTS = [
 ];
 
 // Heuristic text indicators. These are brittle — if the site copy changes,
-// update here. Failure indicators also catch the "court full" rejection.
+// update here. We use TIGHT success indicators only — the word "ยืนยัน"
+// appears in the rules text on every booking.php page and would cause false
+// positive PASS if used as success.
 const ALREADY_BOOKED_INDICATORS = [
   'ได้จองสนามวันนี้แล้ว',
   'จองแล้ว',
   'already booked',
 ];
-const SUCCESS_INDICATORS = ['สำเร็จ', 'จองเรียบร้อย', 'success', 'เรียบร้อย', 'ยืนยัน'];
-const FAILURE_INDICATORS = ['ล้มเหลว', 'ผิดพลาด', 'ไม่สำเร็จ', 'error', 'เต็ม', 'ซ้ำ'];
+// Success: must be on a confirmation page (post-submit redirect). These phrases
+// don't appear on the booking form page itself.
+const SUCCESS_INDICATORS = ['จองเรียบร้อย', 'จองสำเร็จ', 'booking success', 'success'];
+// Failure words that NEVER appear on the post-acknowledge status page —
+// 'เต็ม' (without แล้ว) used to be here but was a false-positive trap:
+// the status page lists every booked slot as "เต็มแล้ว" and a substring
+// match on 'เต็ม' flipped real-success into submit-fail. Use the header
+// check below instead for the status-page case.
+const FAILURE_INDICATORS = ['ล้มเหลว', 'ผิดพลาด', 'ไม่สำเร็จ', 'error', 'ซ้ำ', 'ไม่ว่าง'];
+// Post-submit "การจองสนามวันนี้" view — every booked slot renders "เต็มแล้ว"
+// but no explicit-failure word. We use the page header ("การจองสนาม") as
+// a distinctive marker rather than row count, since real failures can
+// also contain "เต็ม" in a short message.
+const STATUS_PAGE_HEADER = 'การจองสนาม';
 
 type AttemptOutcome =
   | { type: 'success' }
@@ -227,39 +251,57 @@ async function fetchAllReservedTimes(
 }
 
 /**
- * Select the court in the page's #court dropdown and read the actual #time options.
- * This is the SOURCE OF TRUTH for which slots are currently bookable — the page's
- * onchange handler applies time-of-day / date / session filters that the parallel
- * fetch doesn't see.
+ * Attempt to submit a booking for the given (court, slot). The page's #court
+ * dropdown is selected first (triggers AJAX that populates #time), then #time
+ * is selected, then the submit button is clicked.
  *
- * Returns array of slot values (e.g. ['17:00_18:00', '18:00_19:00']). Empty array
- * means no slots are bookable for this court right now.
+ * SHORT TIMEOUTS (3s) on selectOption and click — if the slot was taken by a
+ * racing parallel account, the dropdown won't include it; we want to skip
+ * fast, not wait 30s for the default Playwright actionability timeout.
  */
-async function getDropdownSlots(page: Page, court: CourtInfo): Promise<string[]> {
-  await page.locator('#court').selectOption(court.value);
-  await waitForSlotDropdown(page);
-  return await page.locator('#time').evaluate((el) => {
-    const sel = el as HTMLSelectElement;
-    return Array.from(sel.options)
-      .map((o) => o.value)
-      .filter((v) => v !== '');
-  });
-}
+async function attemptSubmitBooking(
+  page: Page,
+  court: CourtInfo,
+  slot: string
+): Promise<AttemptOutcome> {
+  try {
+    await page.locator('#court').selectOption(court.value, { timeout: 3000 });
+  } catch {
+    return { type: 'submit-fail', reason: 'selectOption(court) timeout' };
+  }
 
-/**
- * Attempt to submit a booking for the currently-selected court and the given slot.
- * Court must already be selected (so #time dropdown is populated).
- */
-async function attemptSubmitBooking(page: Page, slot: string): Promise<AttemptOutcome> {
-  await page.locator('#time').selectOption(slot);
+  // Wait for the AJAX response + dropdown to populate (short window)
+  await Promise.race([
+    page.waitForResponse(
+      (r) => r.url().includes(RESERVED_TIMES_PATH),
+      { timeout: 3000 }
+    ),
+    page.waitForFunction(
+      () => {
+        const sel = document.querySelector('#time') as HTMLSelectElement | null;
+        return sel !== null && sel.options.length > 0 && sel.options[0].value !== '';
+      },
+      { timeout: 3000 }
+    ),
+  ]).catch(() => null);
+
+  try {
+    await page.locator('#time').selectOption(slot, { timeout: 3000 });
+  } catch {
+    return { type: 'submit-fail', reason: 'slot not in dropdown (race?)' };
+  }
+
   const submitBtn = page
     .locator('button:has-text("จอง"), input[type="submit"][value*="จอง" i]')
     .first();
 
-  await Promise.all([
-    page.waitForLoadState('domcontentloaded', { timeout: 15000 }).catch(() => null),
-    submitBtn.click({ timeout: 5000 }),
-  ]);
+  try {
+    await submitBtn.click({ timeout: 3000 });
+  } catch {
+    return { type: 'submit-fail', reason: 'submit click timeout' };
+  }
+
+  await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => null);
 
   const bodyText = (await page.locator('body').textContent()) ?? '';
 
@@ -268,37 +310,29 @@ async function attemptSubmitBooking(page: Page, slot: string): Promise<AttemptOu
   }
 
   const hasSuccess = SUCCESS_INDICATORS.some((s) => bodyText.includes(s));
-  const hasFailure = FAILURE_INDICATORS.some((s) => bodyText.includes(s));
+  const hasExplicitFail = FAILURE_INDICATORS.some((s) => bodyText.includes(s));
+  // Susport's post-acknowledge page (booking.php → "การจองสนามวันนี้"
+  // status table) lists every booked slot as "เต็มแล้ว" but does NOT
+  // include any explicit-failure word. Treat that page as success —
+  // otherwise the server had accepted the booking but the bot recorded
+  // submit-fail (false negative), and the next attempt would book a
+  // second slot for the same account.
+  const looksLikeStatusPage = bodyText.includes(STATUS_PAGE_HEADER);
 
-  if (hasFailure && !hasSuccess) {
+  if (hasSuccess || looksLikeStatusPage) {
+    return { type: 'success' };
+  }
+  if (hasExplicitFail) {
     return {
       type: 'submit-fail',
       reason: bodyText.replace(/\s+/g, ' ').trim().slice(0, 200),
     };
-  }
-  if (hasSuccess) {
-    return { type: 'success' };
   }
 
   return {
     type: 'submit-fail',
     reason: `submit result unclear (url=${page.url()})`,
   };
-}
-
-/**
- * Re-select the court to ensure #time dropdown is populated, then submit the slot.
- * Used after the parallel-fetch phase (where the #time dropdown state is unknown).
- */
-async function selectCourtAndSubmit(
-  page: Page,
-  court: CourtInfo,
-  slot: string
-): Promise<AttemptOutcome> {
-  const slotsReady = waitForSlotDropdown(page);
-  await page.locator('#court').selectOption(court.value);
-  await slotsReady;
-  return attemptSubmitBooking(page, slot);
 }
 
 /**
@@ -369,12 +403,30 @@ export async function bookOneAccount(
     page = await context.newPage();
 
     // ---- Login ----
-    await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
-    await page.locator('input[name="username"]').fill(account.username);
-    await page.locator('input[name="password"]').fill(account.password);
-    await page.locator('input[type="submit"]').click();
-    await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => null);
+    if (options.prewarmedLoginPage) {
+      // Pre-warm path: caller already navigated to login.php and filled the form.
+      // We just click submit on the existing page.
+      page = options.prewarmedLoginPage;
+      await page.locator('input[type="submit"]').click();
+      await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => null);
+    } else {
+      // Standard path: navigate, fill, submit.
+      await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
+      await page.locator('input[name="username"]').fill(account.username);
+      await page.locator('input[name="password"]').fill(account.password);
+      await page.locator('input[type="submit"]').click();
+      await page.waitForLoadState('domcontentloaded', { timeout: 10000 }).catch(() => null);
+    }
 
+    // Login can land on either booking.php (normal) or reservations.php (if user
+    // already booked today — server redirects to their existing reservation view).
+    // reservations.php is not a login failure; it's a "already booked" state.
+    if (page.url().includes('reservations.php')) {
+      result.status = 'FAIL';
+      result.fail_reason = 'already booked today (reservations.php after login)';
+      if (!options.dryRun) await shoot(page, screenshot);
+      return result;
+    }
     if (!page.url().includes('booking.php')) {
       result.status = 'FAIL';
       result.fail_reason = `login failed (landed on ${page.url()})`;
@@ -383,19 +435,19 @@ export async function bookOneAccount(
     }
 
     // ---- Parallel discovery: query all 6 courts in one round-trip ----
-    // This is used as a BINARY HINT only — which courts might have any open slot.
-    // The actual slot list comes from the #time dropdown (source of truth) because
-    // the page applies time-of-day / session filters the parallel fetch can't see.
+    // Computes BOTH (a) which courts have open slots AND (b) the per-court slot
+    // list. With `date` included, the response matches what the page's own onchange
+    // handler shows in the #time dropdown — so we don't need a separate dropdown
+    // read per court (saves ~500ms × courts-to-try).
     const allBadmintonCourts = await getBadmintonCourts(page);
     const courtValues = allBadmintonCourts.map((c) => c.value);
     const reservedByValue = await fetchAllReservedTimes(page, courtValues);
 
-    const maybeAvailable = new Set<string>();
+    const availableByValue = new Map<string, string[]>();
     for (const court of allBadmintonCourts) {
       const reserved = reservedByValue.get(court.value) ?? [];
-      if (ALL_SLOTS.some((s) => !reserved.includes(s))) {
-        maybeAvailable.add(court.value);
-      }
+      const available = ALL_SLOTS.filter((s) => !reserved.includes(s));
+      availableByValue.set(court.value, available);
     }
 
     // ---- Retry-with-fallback loop ----
@@ -404,24 +456,15 @@ export async function bookOneAccount(
 
     let booked: { court: string; slot: string } | null = null;
     let earlyExit: 'already-booked' | null = null;
-    // Track which courts we've read the dropdown for (source-of-truth check)
-    let dropdownRead = false;
+    // After a failed submit, the server may redirect us to a confirmation/failure
+    // page. We only need to navigate back to booking.php before the NEXT attempt.
+    // On the first attempt we're already on booking.php — skip the reset.
+    let onBookingPage = true;
 
     outer: for (const court of courtsToTry) {
       if (Date.now() >= deadline) break;
 
-      // Fast skip: parallel fetch said this court has NO open slots.
-      if (!maybeAvailable.has(court.value)) {
-        result.attempts.push({ court: court.label, slot: '-', outcome: 'no-slots-on-court' });
-        continue;
-      }
-
-      // Source of truth: read #time dropdown after selectOption(court).
-      // This catches cases where parallel fetch is stale / filtered differently.
-      await resetToBookingPage(page);
-      const available = await getDropdownSlots(page, court);
-      dropdownRead = true;
-
+      const available = availableByValue.get(court.value) ?? [];
       if (available.length === 0) {
         result.attempts.push({ court: court.label, slot: '-', outcome: 'no-slots-on-court' });
         continue;
@@ -440,11 +483,14 @@ export async function bookOneAccount(
           break outer;
         }
 
-        // Real path: re-select court (so #time dropdown populates for this court),
-        // then submit slot. After submit, server may redirect — resetToBookingPage
-        // handles that on next iteration if needed.
-        await resetToBookingPage(page);
-        const outcome = await selectCourtAndSubmit(page, court, slot);
+        // Real path: selectOption(court) + selectOption(slot) + submit. Race-loss
+        // with a parallel account is caught by the 3s selectOption timeout — the
+        // dropdown won't include the slot, so we skip and try the next (court, slot).
+        if (!onBookingPage) {
+          await resetToBookingPage(page);
+          onBookingPage = true;
+        }
+        const outcome = await attemptSubmitBooking(page, court, slot);
         if (outcome.type === 'success') {
           result.attempts.push({ court: court.label, slot, outcome: 'success' });
           booked = { court: court.label, slot };
@@ -463,10 +509,11 @@ export async function bookOneAccount(
         result.attempts.push({
           court: court.label,
           slot,
-          outcome: outcome.type === 'slot-not-available' ? 'slot-not-available' : 'submit-fail',
+          outcome: 'submit-fail',
           reason: outcome.type === 'submit-fail' ? outcome.reason : undefined,
         });
-        // slot-not-available or submit-fail — try next slot/court
+        // submit-fail (race or other) — page is now off booking.php, must reset
+        onBookingPage = false;
       }
     }
 
@@ -494,7 +541,7 @@ export async function bookOneAccount(
 
     // Exhausted all (court, slot) combinations within deadline.
     const triedLabels = courtsToTry
-      .filter((c) => !maybeAvailable.has(c.value))
+      .filter((c) => (availableByValue.get(c.value)?.length ?? 0) === 0)
       .map((c) => `${c.label}: no slots`);
     const trail = triedLabels.length > 0 ? ` tried: ${triedLabels.slice(0, 6).join(', ')}` : '';
     result.status = 'FAIL';

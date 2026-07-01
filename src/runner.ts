@@ -1,11 +1,16 @@
 // src/runner.ts
-// Parallel release per SC-05 — all 9 contexts launch in the same tick via Promise.all.
+// Parallel release per SC-05 — all N contexts launch in the same tick via Promise.all.
 // One slow login must NOT delay the others (each account is fully isolated in its own context).
 //
-// Performance: we launch ONE Browser instance and create 9 BrowserContexts from it.
+// Performance: we launch ONE Browser instance and create N BrowserContexts from it.
 // BR-01/02 only forbid reusing a *context*, not a browser — contexts are still fully
-// isolated (separate cookies, localStorage, session storage, cache). This saves ~1s × 8
+// isolated (separate cookies, localStorage, session storage, cache). This saves ~1s × (N-1)
 // redundant Chromium cold starts.
+//
+// Two entry points:
+//   - runAllAccounts(): reads config/accounts.json (used by the local CLI)
+//   - runAccounts(accounts, options): accepts an explicit list (used by the Telegram bot
+//     which books each user's accounts separately)
 
 import { Browser, chromium } from 'playwright';
 import { bookOneAccount, BookingResult, Account, FlowOptions } from './bookingFlow';
@@ -28,28 +33,32 @@ export interface RunSummary {
   counts: { PASS: number; FAIL: number; ERROR: number; 'DRY-RUN': number };
 }
 
-export async function runAllAccounts(options: FlowOptions = {}): Promise<RunSummary> {
+/** Launch one Browser and run all accounts in parallel via Promise.all. */
+async function runAccountsInternal(
+  list: Account[],
+  options: FlowOptions & { reportName?: string } = {}
+): Promise<RunSummary> {
   const started_at = new Date().toISOString();
   const start = Date.now();
 
-  console.log(`\n=== Launching ${accounts.length} accounts in parallel ===`);
+  console.log(`\n=== Launching ${list.length} accounts in parallel ===`);
   console.log(`Mode: ${options.dryRun ? 'DRY-RUN (skip submit)' : 'LIVE'}`);
   console.log(`Started at: ${started_at}\n`);
 
-  // Single Chromium process shared by all 9 contexts.
+  // Single Chromium process shared by all contexts.
   const browser: Browser = await chromium.launch({ channel: 'chrome', headless: true });
 
   try {
     // SC-05: parallel release — Promise.all guarantees all start in the same tick
     const results = await Promise.all(
-      (accounts as Account[]).map((account) =>
+      list.map((account) =>
         bookOneAccount(account, { ...options, browser }).then((result) => {
           const tag = result.status === 'PASS' ? '✓' : result.status === 'DRY-RUN' ? '◉' : '✗';
           console.log(
             `${tag} ${result.username.padEnd(12)} ${result.status.padEnd(8)} ` +
-            `court=${result.court_booked ?? '-'} slot=${result.slot} ` +
-            `${result.fail_reason ? `(${result.fail_reason})` : ''} ` +
-            `[${result.duration_ms}ms]`
+              `court=${result.court_booked ?? '-'} slot=${result.slot} ` +
+              `${result.fail_reason ? `(${result.fail_reason})` : ''} ` +
+              `[${result.duration_ms}ms]`
           );
           return result;
         })
@@ -73,7 +82,7 @@ export async function runAllAccounts(options: FlowOptions = {}): Promise<RunSumm
 
     ensureDir(REPORTS_DIR);
     const stamp = started_at.replace(/[:.]/g, '-');
-    const reportFile = path.join(REPORTS_DIR, `run-${stamp}.json`);
+    const reportFile = path.join(REPORTS_DIR, `${options.reportName ?? 'run'}-${stamp}.json`);
     fs.writeFileSync(reportFile, JSON.stringify(summary, null, 2));
 
     console.log(`\n=== Summary ===`);
@@ -88,4 +97,21 @@ export async function runAllAccounts(options: FlowOptions = {}): Promise<RunSumm
   } finally {
     await browser.close();
   }
+}
+
+/** Local CLI entry — reads config/accounts.json. */
+export async function runAllAccounts(options: FlowOptions = {}): Promise<RunSummary> {
+  return runAccountsInternal(accounts as Account[], options);
+}
+
+/**
+ * Bot entry — accepts an explicit list of accounts.
+ * The bot uses this to book a single user's accounts in isolation, or the owner's
+ * 9 accounts as a single batch.
+ */
+export async function runAccounts(
+  list: Account[],
+  options: FlowOptions & { reportName?: string } = {}
+): Promise<RunSummary> {
+  return runAccountsInternal(list, options);
 }

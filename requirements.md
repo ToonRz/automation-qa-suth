@@ -207,3 +207,31 @@ async function waitUntilNoonThenRun(): Promise<void> {
 > ระบุ **slot เวลาของแต่ละ account** ทั้ง 9 คน (แทนที่ "TBD" ใน accounts.json)
 > เช่น "08:00", "09:00", "10:00" ฯลฯ ตามที่ต้องการจอง
 
+---
+
+## 10. Operational Notes (user-approved divergence from spec)
+
+ข้อต่อไปนี้คือ **deviation** จาก §3.4 / §7 — อนุมัติโดย user แล้ว เพื่อแก้บั๊กที่เจอจริงในวัน 2026-06-30:
+
+### 10.1 Telegram DM delivery — telegraf 4.x outbound hang (fix A)
+
+**ปัญหา**: `bot.telegram.sendMessage()` ใน telegraf 4.x แขวนไม่ resolve บน network นี้ (telegraf ใช้ http.Agent ร่วมกับ long-poll loop ทำให้ outbound call คิว 30+ วินาที และบางครั้งไม่ resolve เลย — ดู [src/server/bot.ts:683-688](src/server/bot.ts)).
+
+**Fix**: สร้าง [src/server/telegramSend.ts](src/server/telegramSend.ts) ใหม่ เรียก Telegram Bot API ตรง ๆ ด้วย native `fetch` + `AbortController` (15s timeout). Mirror pattern ของ `startPollingLoop()` สำหรับ inbound.
+
+- 3 call sites ที่ `bot.ts:609, 619, 632` ถูกเปลี่ยนเป็น `sendTelegramMessage(...)`
+- ทุก call log structured line ลง `bot.log`: `[telegram-send] ok/FAIL/timeout chat=X ms=N`
+- ส่ง DM สำเร็จ → user ได้รับ report ภายใน 15s ของ FIRE; fail → มีบรรทัด log ที่บอก reason
+
+### 10.2 Success detection — false-negative บน susport status page (fix B)
+
+**ปัญหา**: หลังคลิก submit, susport redirect ไปหน้า "การจองสนามวันนี้" (status table แสดง `เต็มแล้ว` ทุก slot ที่จองแล้ว) แต่ไม่มีข้อความ success แบบที่ bot ค้นหา ([src/bookingFlow.ts:102](src/bookingFlow.ts) `SUCCESS_INDICATORS`). Bot ตรวจเจอ `'เต็ม'` ใน `FAILURE_INDICATORS` ([src/bookingFlow.ts:103](src/bookingFlow.ts)) → false-negative → record เป็น ERROR ทั้งที่ server จองสำเร็จ
+
+**Fix**: ตัด `'เต็ม'` ออกจาก `FAILURE_INDICATORS` (ไม่ใช่ explicit-failure บน status page) + เพิ่ม `STATUS_PAGE_HEADER = 'การจองสนาม'` เป็นตัวบอกหน้า status — ถ้า page มี header นี้ + ไม่มี explicit-failure word → treat เป็น success. ดู [src/bookingFlow.ts:103-113](src/bookingFlow.ts) และ [src/bookingFlow.ts:312-326](src/bookingFlow.ts).
+
+### 10.3 Acceptance delta
+
+- **เดิม (§8)**: "ทุก account บันทึก PASS/FAIL/ERROR + screenshot"
+- **เพิ่ม**: report ส่งผ่าน Telegram DM ภายใน 15s ของ noon trigger ไม่ค้าง indefinite; บน susport status-page-success → record PASS (ไม่ใช่ ERROR)
+
+

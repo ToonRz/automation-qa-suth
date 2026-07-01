@@ -19,6 +19,8 @@ screenshots/
 .env.*.local
 accounts.local.json
 config/accounts.json
+config/users.json
+config/*.local.json
 
 # IDE
 .vscode/

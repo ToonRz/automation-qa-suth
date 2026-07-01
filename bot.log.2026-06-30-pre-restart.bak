@@ -1,0 +1,17 @@
+[2026-06-30T05:46:53.373Z] === Court Booking Bot ===
+[2026-06-30T05:46:53.373Z] Telegram token: 8912911313...
+[2026-06-30T05:46:53.374Z] Registered users: 2
+[2026-06-30T05:46:53.979Z] ✓ Telegram reachable as @AutocourtSU_bot (id=8912911313)
+[2026-06-30T05:46:53.982Z] ✓ Noon cron scheduled (12:00 daily)
+[2026-06-30T05:46:53.982Z] Starting bot (custom long-poll loop)...
+[2026-06-30T05:46:54.564Z] [ERROR] [poll] error: TypeError: fetch failed cause=ECONNRESET "read ECONNRESET" errors=[]. Backing off 1000ms
+[2026-06-30T05:46:56.074Z] [ERROR] [poll] error: Error: getUpdates HTTP 409. Backing off 1000ms
+[2026-06-30T05:47:00.365Z] [ERROR] [poll] error: Error: getUpdates HTTP 409. Backing off 2000ms
+[2026-06-30T05:47:02.537Z] [ERROR] [poll] error: Error: getUpdates HTTP 409. Backing off 2000ms
+[2026-06-30T05:47:07.720Z] [ERROR] [poll] error: Error: getUpdates HTTP 409. Backing off 4000ms
+[2026-06-30T05:47:11.891Z] [ERROR] [poll] error: Error: getUpdates HTTP 409. Backing off 4000ms
+[2026-06-30T05:47:16.109Z] [ERROR] [poll] error: Error: getUpdates HTTP 409. Backing off 8000ms
+[2026-06-30T05:47:24.616Z] [ERROR] [poll] error: Error: getUpdates HTTP 409. Backing off 8000ms
+[2026-06-30T05:47:58.199Z] [poll] heartbeat (offset=852802615)
+[2026-06-30T05:49:14.872Z] [poll] heartbeat (offset=852802615)
+[2026-06-30T05:50:31.596Z] [poll] heartbeat (offset=852802615)
