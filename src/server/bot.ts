@@ -42,7 +42,7 @@ import {
   addAccountToUser,
   AccountResult,
 } from './userStore';
-import { runWithPrewarm, runStandard, EngineResult } from './bookingEngine';
+import { runWithPrewarm, runStandard, runWithDeepPrewarm, EngineResult } from './bookingEngine';
 import { sendTelegramMessage } from './telegramSend';
 
 dotenv.config();
@@ -565,10 +565,17 @@ interface ScheduledRun {
 }
 
 async function runScheduledBooking(): Promise<void> {
-  const target = nextNoon(new Date(Date.now() - 1000)); // already past noon — scheduler called manually
-  // Actually: scheduler is called BY cron at noon, so target = now (or now+small drift)
-  const fireTime = new Date();
-  console.log(`\n[scheduler] firing at ${fireTime.toISOString()}`);
+  // Cron fires at 11:55 (5-min lead) so runWithDeepPrewarm has time to login +
+  // pre-select court/slot before the noon tick. fireTime is the PLANNED noon,
+  // not "now" — the engine computes prewarmFireAt = fireTime - PREWARM_LEAD_MS.
+  // (Was `fireTime = new Date()`, which made prewarmFireAt land in the past at
+  // cron callback, defeating the 5-min prewarm window.)
+  const fireTime = nextNoon();
+  console.log(
+    `\n[scheduler] cron fired at ${new Date().toISOString()}, ` +
+      `firing at ${fireTime.toISOString()} ` +
+      `(prewarm window opens at ${new Date(fireTime.getTime() - 5 * 60_000).toISOString()})`
+  );
 
   // Collect: owner always runs at noon. Friends run only if they sent /book.
   const owner = getOwner();
@@ -578,7 +585,17 @@ async function runScheduledBooking(): Promise<void> {
 
   const tasks: { user: typeof owner; run: () => Promise<EngineResult> }[] = [];
   if (owner && owner.accounts.length > 0) {
-    tasks.push({ user: owner, run: () => runWithPrewarm(owner!.accounts, fireTime) });
+    // DEEP_PREWARM=1 upgrades owner task to deep-prewarm (login + court/slot
+    // pre-selected at T-5min, confirm click at noon). Default is shallow
+    // prewarm — preserves the proven 6/9 baseline. One env var to roll back.
+    const useDeep = process.env.DEEP_PREWARM === '1';
+    tasks.push({
+      user: owner,
+      run: () =>
+        useDeep
+          ? runWithDeepPrewarm(owner!.accounts, fireTime)
+          : runWithPrewarm(owner!.accounts, fireTime),
+    });
   }
   for (const friend of pendingFriends) {
     if (friend.accounts.length === 0) continue;
@@ -662,11 +679,15 @@ async function main() {
   // Schedule noon trigger (local time, every day).
   // node-cron uses local time by default. We want 12:00 local — set
   // TZ=Asia/Bangkok in .env so the cron fires on Thai noon.
-  cron.schedule('0 12 * * *', () => {
-    console.log('[cron] noon trigger');
+  // Cron wakes at 11:55 (5-min lead) so the deep-prewarm engine has time to
+  // login + pre-select court/slot before the noon tick. See runScheduledBooking.
+  // Limitation: if the bot restarts between 11:55 and 12:00, today's prewarm
+  // window is missed (cron already fired). Mitigation: keep restart MTTR low.
+  cron.schedule('55 11 * * *', () => {
+    console.log('[cron] noon trigger (prewarm window opened)');
     runScheduledBooking().catch((err) => console.error(`[cron] run failed: ${err}`));
   });
-  console.log('✓ Noon cron scheduled (12:00 daily)');
+  console.log('✓ Noon cron scheduled (11:55 daily, fires at 12:00)');
 
   // Graceful shutdown — our custom poll loop doesn't need bot.stop() (it just
   // exits on signal), but we still wire the handler so the process can be
