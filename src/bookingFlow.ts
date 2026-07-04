@@ -614,8 +614,15 @@ export async function bookOneAccount(
         continue;
       }
 
-      // Slot priority: assigned first, then any other available
-      const slotOrder = [account.slot, ...available.filter((s) => s !== account.slot)];
+      // Slot priority: assigned first, then prefer 21:00_22:00 as the global
+      // preferred fallback (experimental — see feat/prioritize-21-22 PR), then
+      // any remaining available slots.
+      const PROMOTED_FALLBACK = '21:00_22:00';
+      const slotOrder = [
+        account.slot,
+        ...available.filter((s) => s === PROMOTED_FALLBACK && s !== account.slot),
+        ...available.filter((s) => s !== account.slot && s !== PROMOTED_FALLBACK),
+      ];
 
       for (const slot of slotOrder) {
         if (Date.now() >= deadline) break;
