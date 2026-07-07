@@ -14,7 +14,7 @@
 import { runAllAccounts } from './runner';
 import { bookOneAccount, Account } from './bookingFlow';
 import { syncServerTime, getServerNow, getOffsetMs } from './timeSync';
-import accounts from '../config/accounts.json';
+import { getConfig, COURTS } from './server/configLoader';
 
 interface CliOptions {
   now: boolean;
@@ -76,15 +76,15 @@ async function countdown(ms: number): Promise<void> {
 }
 
 async function runSingleAccount(username: string, dryRun: boolean) {
-  const account = (accounts as Account[]).find((a) => a.username === username);
+  const account = getConfig().accounts.find((a) => a.username === username);
   if (!account) {
     console.error(`❌ Account "${username}" not found in config/accounts.json`);
     process.exit(1);
   }
   console.log(`\n=== Single-account debug run ===`);
-  console.log(`Account: ${account.username}  Court: ${account.court}  Slot: ${account.slot}`);
+  console.log(`Account: ${account.username}  Court: ${account.court ?? COURTS[0]}  Slot: ${account.slot}`);
   console.log(`Mode:    ${dryRun ? 'DRY-RUN' : 'LIVE'}\n`);
-  const result = await bookOneAccount(account, { dryRun });
+  const result = await bookOneAccount(account, { dryRun, courtPriority: COURTS });
   console.log(`\nResult: ${result.status}`);
   console.log(`  court_booked: ${result.court_booked}`);
   console.log(`  slot:         ${result.slot}`);
@@ -105,7 +105,7 @@ async function main() {
   if (opts.now) {
     console.log(`\n=== Live run (--now, skipping wait) ===`);
     console.log(`Mode: ${opts.dryRun ? 'DRY-RUN' : 'LIVE'}`);
-    await runAllAccounts({ dryRun: opts.dryRun });
+    await runAllAccounts({ dryRun: opts.dryRun, courtPriority: COURTS });
     return;
   }
 
@@ -142,7 +142,7 @@ async function main() {
       `drift ${fired_at.getTime() - target.getTime()}ms)`
   );
 
-  await runAllAccounts({ dryRun: opts.dryRun });
+  await runAllAccounts({ dryRun: opts.dryRun, courtPriority: COURTS });
 }
 
 main().catch((err) => {

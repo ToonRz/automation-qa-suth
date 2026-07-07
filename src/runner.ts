@@ -14,7 +14,7 @@
 
 import { Browser, chromium } from 'playwright';
 import { bookOneAccount, BookingResult, Account, FlowOptions } from './bookingFlow';
-import accounts from '../config/accounts.json';
+import { getConfig, COURTS } from './server/configLoader';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -36,7 +36,7 @@ export interface RunSummary {
 /** Launch one Browser and run all accounts in parallel via Promise.all. */
 async function runAccountsInternal(
   list: Account[],
-  options: FlowOptions & { reportName?: string } = {}
+  options: FlowOptions & { reportName?: string } = { courtPriority: COURTS }
 ): Promise<RunSummary> {
   const started_at = new Date().toISOString();
   const start = Date.now();
@@ -52,7 +52,7 @@ async function runAccountsInternal(
     // SC-05: parallel release — Promise.all guarantees all start in the same tick
     const results = await Promise.all(
       list.map((account) =>
-        bookOneAccount(account, { ...options, browser }).then((result) => {
+        bookOneAccount(account, { ...options, browser, courtPriority: options.courtPriority ?? COURTS }).then((result) => {
           const tag = result.status === 'PASS' ? '✓' : result.status === 'DRY-RUN' ? '◉' : '✗';
           console.log(
             `${tag} ${result.username.padEnd(12)} ${result.status.padEnd(8)} ` +
@@ -100,8 +100,10 @@ async function runAccountsInternal(
 }
 
 /** Local CLI entry — reads config/accounts.json. */
-export async function runAllAccounts(options: FlowOptions = {}): Promise<RunSummary> {
-  return runAccountsInternal(accounts as Account[], options);
+export async function runAllAccounts(
+  options: FlowOptions = { courtPriority: COURTS }
+): Promise<RunSummary> {
+  return runAccountsInternal(getConfig().accounts, options);
 }
 
 /**
@@ -111,7 +113,7 @@ export async function runAllAccounts(options: FlowOptions = {}): Promise<RunSumm
  */
 export async function runAccounts(
   list: Account[],
-  options: FlowOptions & { reportName?: string } = {}
+  options: FlowOptions & { reportName?: string } = { courtPriority: COURTS }
 ): Promise<RunSummary> {
   return runAccountsInternal(list, options);
 }

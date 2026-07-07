@@ -97,8 +97,29 @@ function main(): void {
       console.error('❌ Owner has zero accounts — /useredit test needs ≥1');
       process.exit(1);
     }
+    // Mutate the owner's first account using course values that the COURTS_AVAILABLE
+    // list already permits (per requirements). We pick distinct alt values that
+    // are also valid so that we can verify the patch stuck.
+    // To find a "different" court and slot, scan the available lists.
+    const COURTS_AVAILABLE = [
+      'แบดมินตัน1',
+      'แบดมินตัน2',
+      'แบดมินตัน3',
+      'แบดมินตัน4',
+    ];
+    const SLOTS_AVAILABLE = [
+      '16:30_17:30',
+      '17:30_18:30',
+      '18:30_19:30',
+      '19:30_20:30',
+      '20:30_21:30',
+      '21:30_22:30',
+    ];
     const firstAccount: Account = owner.accounts[0];
-    const originalCourt = firstAccount.court;
+    // Per-account `court` field is deprecated (court priority now lives at top-level
+    // COURT_PRIORITY in config/accounts.json). Tolerate undefined here — fall back to
+    // COURTS_AVAILABLE[0] so the patch assertions below have a meaningful baseline.
+    const originalCourt = firstAccount.court ?? COURTS_AVAILABLE[0];
     const originalSlot = firstAccount.slot;
     check(
       'owner has ≥1 account for /useredit test',
@@ -164,24 +185,6 @@ function main(): void {
     // --- Phase 2: updateAccountInUser ---
     console.log('\n--- Phase 2: updateAccountInUser ---');
 
-    // Mutate the owner's first account using course values that the COURTS_AVAILABLE
-    // list already permits (per requirements). We pick distinct alt values that
-    // are also valid so that we can verify the patch stuck.
-    // To find a "different" court and slot, scan the available lists.
-    const COURTS_AVAILABLE = [
-      'แบดมินตัน1',
-      'แบดมินตัน2',
-      'แบดมินตัน3',
-      'แบดมินตัน4',
-    ];
-    const SLOTS_AVAILABLE = [
-      '16:30_17:30',
-      '17:30_18:30',
-      '18:30_19:30',
-      '19:30_20:30',
-      '20:30_21:30',
-      '21:30_22:30',
-    ];
     const altCourt = COURTS_AVAILABLE.find((c) => c !== originalCourt) ?? COURTS_AVAILABLE[1];
     const altSlot = SLOTS_AVAILABLE.find((s) => s !== originalSlot) ?? SLOTS_AVAILABLE[1];
 

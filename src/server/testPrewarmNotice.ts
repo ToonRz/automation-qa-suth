@@ -148,12 +148,14 @@ async function main(): Promise<void> {
 
   // (e) New message body — account-breakdown grouping is present.
   const hasBreakdownHeader = /แผนจอง/.test(funcBody);
-  const hasByCourt = /\bbyCourt\b/.test(funcBody);
+  // After the slot-first / court-priority-second refactor the display groups
+  // by slot (per-account court is vestigial).
+  const hasBySlot = /\bbySlot\b/.test(funcBody);
   console.log(
     `  ${hasBreakdownHeader ? '✅' : '❌'} new: account-breakdown header "แผนจอง" present`
   );
   console.log(
-    `  ${hasByCourt ? '✅' : '❌'} new: byCourt grouping present`
+    `  ${hasBySlot ? '✅' : '❌'} new: bySlot grouping present (slot-first refactor)`
   );
 
   // (f) Caller-side assertion — caller passes the recipient array as the
@@ -180,7 +182,7 @@ async function main(): Promise<void> {
     !takesCronFireAt ||
     !noHardcodedLead ||
     !hasBreakdownHeader ||
-    !hasByCourt ||
+    !hasBySlot ||
     !callerPassesCorrectArgs
   ) {
     console.error('❌ Source-level assertions failed');
@@ -209,20 +211,25 @@ function nextNoonLocal(): Date {
 }
 
 /** Mirror of sendPrewarmNoticesForBooking's message-building logic, factored out
- *  for direct test invocation. Kept in sync by source-level assertions above. */
+ *  for direct test invocation. Kept in sync by source-level assertions above.
+ *
+ *  NOTE: pre-refactor this grouped by per-account `court`. After the priority
+ *  refactor (court is config-driven, per-account court is deprecated), we group
+ *  by `slot` instead — the slot is the per-account invariant the bot honors at
+ *  noon, and the priority list applies uniformly to every account. */
 function buildPrewarmText(
-  owner: { display_name: string; accounts: Array<{ username: string; court: string; slot: string }> },
+  owner: { display_name: string; accounts: Array<{ username: string; slot: string }> },
   fireTime: Date,
   cronFireAt: Date
 ): string {
-  const byCourt = new Map<string, typeof owner.accounts>();
+  const bySlot = new Map<string, typeof owner.accounts>();
   for (const acc of owner.accounts) {
-    const list = byCourt.get(acc.court) ?? [];
+    const list = bySlot.get(acc.slot) ?? [];
     list.push(acc);
-    byCourt.set(acc.court, list);
+    bySlot.set(acc.slot, list);
   }
-  for (const list of byCourt.values()) {
-    list.sort((a, b) => a.slot.localeCompare(b.slot));
+  for (const list of bySlot.values()) {
+    list.sort((a, b) => a.username.localeCompare(b.username));
   }
 
   const fmtTime = (d: Date): string => d.toTimeString().slice(0, 8);
@@ -238,10 +245,10 @@ function buildPrewarmText(
   lines.push(`⏳ เหลืออีก ${leadMin} นาที`);
   lines.push('');
   lines.push(`🎯 แผนจอง:`);
-  for (const [court, accounts] of byCourt) {
-    lines.push(`   🏸 ${court} (${accounts.length} คิว)`);
+  for (const [slot, accounts] of bySlot) {
+    lines.push(`   🕒 ${fmtSlot(slot)} (${accounts.length} คิว)`);
     for (const acc of accounts) {
-      lines.push(`      • ${acc.username} · ${fmtSlot(acc.slot)}`);
+      lines.push(`      • ${acc.username}`);
     }
   }
   lines.push('');

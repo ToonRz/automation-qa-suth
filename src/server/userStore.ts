@@ -15,7 +15,10 @@ const USERS_PATH = path.resolve(__dirname, '..', '..', 'config', 'users.json');
 export interface Account {
   username: string;
   password: string;
-  court: string;
+  /** @deprecated Use COURT_PRIORITY in config/accounts.json. Kept for backward
+   *  compat with running accounts that still have the field set; loaders
+   *  tolerate undefined and the booking flow does not consume it. */
+  court?: string;
   slot: string;
 }
 

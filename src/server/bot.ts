@@ -648,7 +648,7 @@ async function handleUserEditWizardStep(
       wiz.step = 'pick_field';
       await reply(
         `✓ account: ${acc.username}\n` +
-          `ปัจจุบัน: court=${acc.court}, slot=${acc.slot}\n\n` +
+          `ปัจจุบัน: court=${acc.court ?? '(ไม่ได้ตั้ง — ใช้ COURT_PRIORITY กลาง)'}, slot=${acc.slot}\n\n` +
           'ขั้นที่ 2/4: ต้องการแก้อะไร?\n' +
           '  1. court (สนาม)\n' +
           '  2. slot (เวลา)\n\n' +
@@ -1258,15 +1258,19 @@ async function sendPrewarmNoticesForBooking(
       // rest. Each user gets their own sendTelegramMessage() call and their
       // own log line.
       try {
-        // Group accounts by court, then sort each group by slot for stable display.
-        const byCourt = new Map<string, typeof user.accounts>();
+        // Group accounts by slot, then sort each group by username for stable
+        // display. After the slot-first / court-priority-second refactor the
+        // per-account `court` field is vestigial — every account honors the
+        // global COURT_PRIORITY list. Display by slot reflects the actual
+        // invariant the bot upholds at noon.
+        const bySlot = new Map<string, typeof user.accounts>();
         for (const acc of user.accounts) {
-          const list = byCourt.get(acc.court) ?? [];
+          const list = bySlot.get(acc.slot) ?? [];
           list.push(acc);
-          byCourt.set(acc.court, list);
+          bySlot.set(acc.slot, list);
         }
-        for (const list of byCourt.values()) {
-          list.sort((a, b) => a.slot.localeCompare(b.slot));
+        for (const list of bySlot.values()) {
+          list.sort((a, b) => a.username.localeCompare(b.username));
         }
 
         const lines: string[] = [];
@@ -1278,15 +1282,15 @@ async function sendPrewarmNoticesForBooking(
         lines.push(`⏳ เหลืออีก ${leadMin} นาที`);
         lines.push('');
         lines.push(`🎯 แผนจอง:`);
-        for (const [court, accounts] of byCourt) {
-          lines.push(`   🏸 ${court} (${accounts.length} คิว)`);
+        for (const [slot, accounts] of bySlot) {
+          lines.push(`   🕒 ${fmtSlot(slot)} (${accounts.length} คิว)`);
           for (const acc of accounts) {
-            lines.push(`      • ${acc.username} · ${fmtSlot(acc.slot)}`);
+            lines.push(`      • ${acc.username}`);
           }
         }
         lines.push('');
         lines.push(`━━━━━━━━━━━━━━━━━━`);
-        lines.push(`🛠  [Login → เลือก court → เลือก slot → ยืนยัน]`);
+        lines.push(`🛠  [Login → เลือก court (priority) → เลือก slot → ยืนยัน]`);
         const text = lines.join('\n');
 
         await sendNoticeWithRetry(user.chat_id, text);

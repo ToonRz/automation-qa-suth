@@ -32,9 +32,12 @@ import {
   FlowOptions,
   getBadmintonCourts,
   fetchAllReservedTimes,
-  prioritizeCourts,
+  buildCourtPriority,
+  ALL_SLOTS,
 } from '../bookingFlow';
 import { getServerNow } from '../timeSync';
+import { COURTS } from './configLoader';
+import { getOwner } from './userStore';
 
 const LOGIN_URL = 'https://susport.sc.su.ac.th/login.php';
 const SCREENSHOTS_DIR = '/app/screenshots'; // overridden via env in deploy
@@ -92,6 +95,45 @@ async function spinUntil(targetMs: number): Promise<void> {
   }
 }
 
+/**
+ * Best-effort Telegram DM to the owner listing accounts whose assigned slot
+ * was reserved on every court at T-5min. Mirrors the native-fetch +
+ * AbortController pattern in src/server/telegramSend.ts. Failure to send must
+ * NOT abort the booking — the console line in the caller is the source of
+ * truth.
+ */
+async function sendDeepPrewarmAbortAlert(
+  stuckAccounts: { username: string; slot: string }[]
+): Promise<void> {
+  const owner = getOwner();
+  const token = process.env.TELEGRAM_BOT_TOKEN;
+  if (!owner || !token) return; // console line above is the source of truth
+  const text =
+    `⛔ DEEP PREWARM ABORTED (T-5min)\n\n` +
+    `${stuckAccounts.length} account(s) ไม่มีสนามว่างสำหรับ slot ที่จอง:\n` +
+    stuckAccounts.map((s) => `  - ${s.username} (slot=${s.slot})`).join('\n') +
+    `\n\nBot จะรัน standard mode ตอนเที่ยงแทน — ตรวจสอบ slot ที่ถูกจองไปก่อนหน้า`;
+
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 15_000);
+  try {
+    const res = await fetch(
+      `https://api.telegram.org/bot${token}/sendMessage`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ chat_id: owner.chat_id, text }),
+        signal: ctrl.signal,
+      }
+    );
+    if (!res.ok) {
+      console.warn(`[bookingEngine] abort-alert DM ${res.status}`);
+    }
+  } finally {
+    clearTimeout(t);
+  }
+}
+
 export interface EngineResult {
   results: BookingResult[];
   mode: 'prewarm' | 'standard';
@@ -107,6 +149,7 @@ export async function runStandard(accounts: Account[]): Promise<EngineResult> {
       accounts.map((account) =>
         bookOneAccount(account, {
           browser,
+          courtPriority: COURTS,
           screenshotsDir: process.env.SCREENSHOTS_DIR ?? SCREENSHOTS_DIR,
         })
       )
@@ -156,6 +199,7 @@ export async function runWithPrewarm(
         bookOneAccount(account, {
           prewarmedLoginPage: page,
           browser,
+          courtPriority: COURTS,
           screenshotsDir: process.env.SCREENSHOTS_DIR ?? SCREENSHOTS_DIR,
         })
       )
@@ -211,12 +255,12 @@ async function prewarmContextsDeep(
         const allCourts = await getBadmintonCourts(page);
         const courtValues = allCourts.map((c) => c.value);
         const reservedMap = await fetchAllReservedTimes(page, courtValues);
-        const prioritizedCourts = prioritizeCourts(account.court, allCourts);
+        const prioritizedCourts = buildCourtPriority(COURTS, allCourts);
         const altCourt = prioritizedCourts.find((c) => {
           const reserved = reservedMap.get(c.value) ?? [];
           return !reserved.includes(account.slot);
         }) ?? prioritizedCourts[0];
-        const targetCourtLabel = altCourt?.label ?? account.court;
+        const targetCourtLabel = altCourt?.label ?? COURTS[0];
         // 3. Select court dropdown (assigned OR alt with same slot)
         await page.locator('select#court').selectOption({ label: targetCourtLabel });
         // 4. Wait for the AJAX-driven #time dropdown to populate (more than the
@@ -244,6 +288,11 @@ async function prewarmContextsDeep(
 
 export interface DeepPrewarmEngineResult extends EngineResult {
   perAccount: PrewarmedDeepContext[];
+  /** True when the invariant check found accounts whose assigned slot is reserved
+   *  on every priority + safety-net court. Bot can surface this in summary DMs. */
+  prewarmAborted: boolean;
+  /** Usernames whose slot was reserved on every court at T-5min. */
+  abortedAccounts: string[];
 }
 
 /**
@@ -296,6 +345,61 @@ export async function runWithDeepPrewarm(
       }
     }
 
+    // ---- INVARIANT CHECK: every account must have its own slot open in at least
+    // one priority + safety-net court at T-5min. If a pre-noon manual booking
+    // already took the slot everywhere, abort the prewarm with a loud alert so
+    // the user can act before noon instead of wasting 3-5s on a doomed fast-
+    // confirm. Stuck contexts are marked 'failed' and dispatched to standard
+    // mode at noon (the 30s retry budget can still recover if the manual
+    // bookings are withdrawn).
+    const stuckAccounts: { username: string; slot: string }[] = [];
+    for (const c of contexts) {
+      if (c.status !== 'page-ready' || !c.page) continue;
+      try {
+        const courts = await getBadmintonCourts(c.page);
+        const values = courts.map((cc) => cc.value);
+        const reserved = await fetchAllReservedTimes(c.page, values);
+        const priorityCourts = buildCourtPriority(COURTS, courts);
+        const anyOpen = priorityCourts.some((court) => {
+          const taken = reserved.get(court.value) ?? [];
+          return !taken.includes(c.account.slot);
+        });
+        if (!anyOpen) {
+          stuckAccounts.push({ username: c.account.username, slot: c.account.slot });
+        }
+      } catch (err) {
+        // Reservation query failed — treat as "stuck" only if courts query succeeded.
+        // Don't false-positive on transient network errors; log and continue.
+        console.warn(
+          `[bookingEngine] invariant check failed for ${c.account.username}: ${err}`
+        );
+      }
+    }
+
+    let prewarmAborted = false;
+    let abortedAccounts: string[] = [];
+    if (stuckAccounts.length > 0) {
+      prewarmAborted = true;
+      abortedAccounts = stuckAccounts.map((s) => s.username);
+      console.error(
+        `[bookingEngine] ABORT deep-prewarm — ${stuckAccounts.length} account(s) ` +
+          `have NO viable court for their assigned slot at T-5min:\n` +
+          stuckAccounts.map((s) => `  - ${s.username} (slot=${s.slot})`).join('\n')
+      );
+      await sendDeepPrewarmAbortAlert(stuckAccounts).catch((err) =>
+        console.error(`[bookingEngine] telegram abort-alert failed: ${err}`)
+      );
+      for (const c of contexts) {
+        if (stuckAccounts.some((s) => s.username === c.account.username)) {
+          c.status = 'failed';
+          c.error = `invariant: slot ${c.account.slot} ไม่ว่างในทุกสนาม at T-5min`;
+          if (c.context) await c.context.close().catch(() => null);
+          c.context = null;
+          c.page = null;
+        }
+      }
+    }
+
     // Tab-throttle mitigation: nudge each ready page so backgrounded Chromium
     // tabs don't drift into a throttled state during the 5-min idle window.
     for (const c of contexts) {
@@ -323,7 +427,7 @@ export async function runWithDeepPrewarm(
       const missResults: BookingResult[] = accounts.map((account) => ({
         username: account.username,
         triggered_at: firedAt.toISOString(),
-        court_attempted: account.court,
+        court_attempted: COURTS[0] ?? account.court ?? '',
         court_booked: null,
         slot: account.slot,
         status: 'FAIL',
@@ -337,6 +441,8 @@ export async function runWithDeepPrewarm(
         mode: 'prewarm',
         total_ms: Date.now() - start,
         perAccount: contexts,
+        prewarmAborted,
+        abortedAccounts,
       };
     }
 
@@ -352,6 +458,7 @@ export async function runWithDeepPrewarm(
       contexts.map(({ account, page, status }) => {
         const baseOpts: FlowOptions = {
           browser,
+          courtPriority: COURTS,
           screenshotsDir: process.env.SCREENSHOTS_DIR ?? SCREENSHOTS_DIR,
         };
         if (status === 'page-ready' && page) {
@@ -361,7 +468,7 @@ export async function runWithDeepPrewarm(
       })
     );
 
-    return { results, mode: 'prewarm', total_ms: Date.now() - start, perAccount: contexts };
+    return { results, mode: 'prewarm', total_ms: Date.now() - start, perAccount: contexts, prewarmAborted, abortedAccounts };
   } finally {
     // Close ALL deep-prewarmed contexts (BR-04) — engine owns them because
     // bookOneAccount received them via prewarmedBookingPage and did not own

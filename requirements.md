@@ -59,25 +59,40 @@
 3. กรอก username และ password ของ account นั้น
 4. กด Login → รอ redirect / confirm login สำเร็จ
 5. ไปที่หน้าจองสนาม
-6. เลือกสนาม "แบดมินตัน1"
-   └─ ถ้าสนามเต็ม → fallback เลือก "แบดมินตัน4"
-   └─ ถ้าทั้ง 2 เต็ม → บันทึก FAIL + screenshot แล้วจบ
+6. เลือกสนามตาม COURT_PRIORITY (priority-court #1 ก่อน แล้ว #2 แล้วตามด้วย safety net)
+   └─ ทุก court จะใช้ slot ของ account เท่านั้น — ไม่มี per-court slot fallback
+   └─ ถ้า assigned slot ไม่ว่างในทุก court → FAIL
 7. เลือก slot เวลาของ account นั้น (ตาม Time Assignment ข้อ 2)
 8. ยืนยันการจอง (กด submit / confirm)
 9. ตรวจสอบว่าการจองสำเร็จ → บันทึก PASS + screenshot
 10. context.close()
 ```
 
-### 3.4 Court Selection Logic — Retry-with-Fallback
+### 3.4 Court Selection Logic — Slot-time-first (Retry-with-Fallback)
+
+Priority is **slot-time-first, court-priority-second** — ทุก account จอง slot ของตัวเองเท่านั้น:
+
+1. ทุก account จะลอง `(priority-court #1, assigned-slot)` ก่อน
+2. ถ้าเต็ม → ลอง `(priority-court #2, assigned-slot)`
+3. ถ้าทั้งสอง priority courts เต็ม → ลอง safety-net courts (แบดมินตัน3, 5, 6, …) ตาม dropdown order
+4. ถ้า assigned slot ไม่ว่างในทุกสนาม (priority + safety net) → FAIL with reason `slot {slot} ไม่ว่างในทุกสนาม`
+
+**ห้าม fallback ไป slot อื่นภายในสนามเดียวกัน** — ทุก account จอง slot ของตัวเองเท่านั้น
 
 ```
-PRIMARY     → แบดมินตัน1
-FALLBACK    → แบดมินตัน4
-EXTENDED    → แบดมินตันอื่นๆ ที่ dropdown มี (แบดมินตัน2, 3, 5, 6, …) — ยกเว้นเทนนิส
-ABORT       → ไม่เจอ (court, slot) ใดว่างภายใน 30s: status = FAIL
+COURT_PRIORITY:
+  lives at top-level of config/accounts.json as a string[]
+  e.g. ["แบดมินตัน2", "แบดมินตัน1"]
+  safety-net = remaining badminton courts in dropdown order (implicit)
+
+PRIMARY     → COURTS[0]
+SECONDARY   → COURTS[1]
+SAFETY NET  → other badminton courts (excludes เทนนิส)
+ABORT       → slot taken in every court: status = FAIL with reason
+              "slot {slot} ไม่ว่างในทุกสนาม"
 ```
 
-**Slot priority (ต่อ 1 court):** assigned slot ก่อน → slot อื่นที่ dropdown มีให้
+**Deep-prewarm invariant (T-5min):** ก่อนถึงเที่ยง ทุก account ต้องมี (priority/safety-net court, assigned-slot) ที่ยังว่างอย่างน้อย 1 court ถ้าไม่มีเลย → ABORT deep prewarm + loud alert (console + Telegram DM to owner)
 
 **Retry budget:** สูงสุด **30 วินาที** ต่อ account (เริ่มนับหลัง login เสร็จ) — ถ้าเกินจะหยุด loop และบันทึก FAIL
 
@@ -88,7 +103,7 @@ ABORT       → ไม่เจอ (court, slot) ใดว่างภายใ�
 
 **Special case:** ถ้า submit fail แล้ว server redirect ออกจาก `booking.php` ต้อง `goto(booking.php)` ก่อน retry (handled in `resetToBookingPage()`)
 
-> **หมายเหตุ:** พฤติกรรมนี้ขยายจาก spec เดิม (ที่ระบุ ABORT = ทั้ง 2 เต็ม) — เพิ่ม EXTENDED layer เพื่อเพิ่มโอกาสสำเร็จ และรองรับกรณีที่สนามอื่นยังมี slot ว่าง
+> **หมายเหตุ:** พฤติกรรมนี้ทดแทน spec เดิม (PRIMARY=แบดมินตัน1, FALLBACK=แบดมินตัน4, EXTENDED=other badminton) — เปลี่ยนเป็น slot-first เพื่อแก้ปัญหา collision เมื่อ 4 accounts เล็งสนามเดียวกันเวลาเดียวกัน (เจอ 2026-07-07)
 
 ---
 
@@ -194,7 +209,9 @@ async function waitUntilNoonThenRun(): Promise<void> {
 - [ ] รันเที่ยงตรง 12:00:00 น. พอดี — ไม่มี tolerance
 - [ ] 9 accounts เริ่มพร้อมกัน (parallel) ภายใน millisecond เดียวกัน
 - [ ] แต่ละ account ได้ BrowserContext ใหม่แยกกัน (ไม่ share cookie/session)
-- [ ] เลือก แบดมินตัน1 ก่อน → fallback แบดมินตัน4 → FAIL ถ้าทั้งคู่เต็ม
+- [ ] Court priority อยู่ที่ top-level `COURT_PRIORITY` ใน config/accounts.json (ไม่ hardcode ใน code)
+- [ ] Deep prewarm abort + loud alert ถ้า account ไหรไม่มี priority court ที่ slot ตัวเองว่าง ณ T-5min
+- [ ] Per-court slot fallback ปิด — ลองเฉพาะ slot ของ account เท่านั้น
 - [ ] แต่ละ account จองเวลา slot ของตัวเองตาม config
 - [ ] บันทึก screenshot ทุก account ทั้ง PASS และ FAIL
 - [ ] Report สรุปผลรวมของทั้ง 9 accounts
@@ -233,5 +250,26 @@ async function waitUntilNoonThenRun(): Promise<void> {
 
 - **เดิม (§8)**: "ทุก account บันทึก PASS/FAIL/ERROR + screenshot"
 - **เพิ่ม**: report ส่งผ่าน Telegram DM ภายใน 15s ของ noon trigger ไม่ค้าง indefinite; บน susport status-page-success → record PASS (ไม่ใช่ ERROR)
+
+### 10.4 Slot-first / court-priority-second refactor (2026-07-07)
+
+**ปัญหา**: 2026-07-07 เจอ 4 accounts พร้อม warm slot เดียวกันใน `แบดมินตัน1` — priority เดิม court-first (assigned-court → fallback → other badminton) ไม่ได้ enforce "ทุก account มี slot ตัวเองใน court ที่จองได้"
+
+**Fix**: 
+- เปลี่ยน priority เป็น **slot-first, court-priority-second**: ทุก account ลอง `COURTS[0]` ก่อนด้วย slot ของตัวเอง → fallback `COURTS[1]` → safety-net (other badminton)
+- **Per-court slot fallback ปิด** — ถ้า slot ตัวเองไม่ว่างใน court นั้น → ข้ามไป court ถัดไป (ไม่ลอง slot อื่นใน court เดียวกัน)
+- Court priority ย้ายจาก hardcode `แบดมินตัน1` → `แบดมินตัน4` เป็น config-driven ที่ top-level `COURT_PRIORITY` ใน `config/accounts.json` (default `["แบดมินตัน2", "แบดมินตัน1"]`)
+- **Deep-prewarm invariant check**: ที่ T-5min ถ้า account ไหรไม่มี (priority + safety-net court) ที่ slot ตัวเองว่างเลย → ABORT prewarm + console error + Telegram DM to owner
+- Per-account `court` field กลายเป็น `@deprecated` (เก็บไว้เพื่อ backward compat กับ running accounts/users.json ที่อาจยังมี field นี้ — loaders tolerate undefined)
+
+**ไฟล์ที่เปลี่ยน**:
+- `config/accounts.json` — schema ใหม่ `{COURT_PRIORITY, accounts}`; per-account `court` ออก
+- `src/server/configLoader.ts` (NEW) — single source of truth, validate schema
+- `src/bookingFlow.ts` — `prioritizeCourts` → `buildCourtPriority(priorityList, available)`; `slotOrder` collapse เหลือแค่ `account.slot`; FAIL message ใหม่ `slot {slot} ไม่ว่างในทุกสนาม`
+- `src/server/bookingEngine.ts` — invariant check + `sendDeepPrewarmAbortAlert` helper; `DeepPrewarmEngineResult.prewarmAborted` + `abortedAccounts`
+- `src/server/userStore.ts` — `Account.court` → optional deprecated
+- `src/runner.ts`, `src/scheduler.ts` — ใช้ `configLoader`; pass `courtPriority: COURTS`
+- `src/server/bot.ts` (prewarm notice) — group display ตาม slot ไม่ใช่ per-account court
+- `src/server/{testWizardHelpers,testPrewarmNotice,sendDryRunMessages}.ts` — test mirrors + assertions sync กับ production
 
 

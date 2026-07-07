@@ -14,13 +14,16 @@
 //   2. Parallel-fetch reserved times for all 6 badminton courts in one page.evaluate
 //      (must include `date` — server returns [] without it)
 //   3. Compute available slots per court from parallel-fetch data
-//   4. Iterate priority queue: assigned court → fallback → other badminton
-//   5. For each "has-slots" court: selectOption(court) → selectOption(slot) → submit
+//   4. Iterate priority queue (config-driven COURT_PRIORITY → remaining badminton)
+//      trying ONLY the account's own slot per court
+//   5. For each "has-my-slot" court: selectOption(court) → selectOption(slot) → submit
 //      (race-loss with another parallel account is caught by short timeout)
 //   6. Bail out on success / "already booked today" / 30s deadline
 //
-// Spec note: this extends requirements §3.4 (originally PRIMARY=1, FALLBACK=4, ABORT=both
-// full) with an EXTENDED layer that walks other badminton courts. Approved by user.
+// Spec note: this implements requirements §3.4 (slot-time-first, court-priority-second).
+// The court priority list comes from `COURT_PRIORITY` in config/accounts.json (see
+// src/server/configLoader.ts). Per-court slot fallback is intentionally disabled —
+// every account tries ONLY its own slot across the priority list.
 
 import { Browser, BrowserContext, Page, chromium } from 'playwright';
 import * as fs from 'fs';
@@ -29,7 +32,11 @@ import * as path from 'path';
 export interface Account {
   username: string;
   password: string;
-  court: string; // e.g. "แบดมินตัน1"
+  /** @deprecated Use COURT_PRIORITY in config/accounts.json (see
+   *  src/server/configLoader.ts). Kept for backward compat with running
+   *  accounts that still have the field set; the booking flow no longer
+   *  consults it — court selection is config-driven via `FlowOptions.courtPriority`. */
+  court?: string;
   slot: string;  // e.g. "17:30_18:30"
 }
 
@@ -59,6 +66,18 @@ export interface FlowOptions {
   screenshotsDir?: string; // override default screenshot directory
   browser?: Browser;       // reuse an existing browser (single launch across N contexts)
   retryDeadlineMs?: number;// override 30s retry budget (for tests)
+  /**
+   * Ordered list of courts every account tries first with their own slot.
+   * Sourced from `COURT_PRIORITY` in config/accounts.json (see
+   * src/server/configLoader.ts). The booking loop appends remaining badminton
+   * courts in dropdown order as a safety net after this list.
+   *
+   * Optional in the type for caller convenience — every production caller
+   * (runner.ts, scheduler.ts, bookingEngine.ts) injects COURTS from
+   * configLoader. bookOneAccount treats undefined as `[]` and degrades to
+   * the safety-net-only path (every court is tried in dropdown order).
+   */
+  courtPriority?: string[];
   /**
    * A page that has ALREADY been navigated to login.php and had username/password
    * filled in but NOT submitted. Used by the pre-warm optimization: open N contexts
@@ -94,7 +113,6 @@ const BOOKING_URL = 'https://susport.sc.su.ac.th/booking.php';
 const RESERVED_TIMES_PATH = 'get_reserved_times';
 const DEFAULT_SCREENSHOTS_DIR = path.resolve(__dirname, '..', 'screenshots');
 const DEFAULT_RETRY_DEADLINE_MS = 30_000;
-const FALLBACK_COURT = 'แบดมินตัน4';
 
 /**
  * Grace retry window for soft-hold slot recovery at T+0.
@@ -388,19 +406,43 @@ async function resetToBookingPage(page: Page): Promise<void> {
 }
 
 /**
- * Build priority-ordered court list: assigned → FALLBACK_COURT → other badminton courts.
+ * Build priority-ordered court list from a config-driven priority array.
+ *
+ * Layered behavior:
+ *   1. Priority list (config-driven) — entries that exist in `available`,
+ *      in given order.
+ *   2. Safety net — remaining badminton courts (the dropdown order may have
+ *      inserted แบดมินตัน3/5/6 after the priority entries) appended in
+ *      their original dropdown order.
+ *
+ * Within a court the per-account slot is the ONLY slot tried (slot priority
+ * is the user's chosen slot — no per-court slot fallback, by user direction).
+ *
+ * Replaces the older `prioritizeCourts(assigned, available)` which was driven
+ * by the now-deprecated per-account `court` field.
  */
-export function prioritizeCourts(assigned: string, available: CourtInfo[]): CourtInfo[] {
-  const priority: CourtInfo[] = [];
-  const find = (label: string) => available.find((c) => c.label === label);
-  const assignedCourt = find(assigned);
-  if (assignedCourt) priority.push(assignedCourt);
-  const fallback = find(FALLBACK_COURT);
-  if (fallback && assigned !== FALLBACK_COURT) priority.push(fallback);
-  for (const c of available) {
-    if (!priority.includes(c)) priority.push(c);
+export function buildCourtPriority(
+  priorityList: string[],
+  available: CourtInfo[]
+): CourtInfo[] {
+  const out: CourtInfo[] = [];
+  const seen = new Set<string>();
+  // Layer 1: config-driven priority, only entries present in the dropdown.
+  for (const label of priorityList) {
+    const court = available.find((c) => c.label === label);
+    if (court && !seen.has(court.label)) {
+      out.push(court);
+      seen.add(court.label);
+    }
   }
-  return priority;
+  // Layer 2: safety net — remaining badminton courts in dropdown order.
+  for (const court of available) {
+    if (!seen.has(court.label)) {
+      out.push(court);
+      seen.add(court.label);
+    }
+  }
+  return out;
 }
 
 // ---------- main entry ----------
@@ -414,11 +456,14 @@ export async function bookOneAccount(
   const screenshotsDir = options.screenshotsDir ?? DEFAULT_SCREENSHOTS_DIR;
   const screenshot = path.join(screenshotsDir, `${account.username}.png`);
   const deadlineMs = options.retryDeadlineMs ?? DEFAULT_RETRY_DEADLINE_MS;
+  // Treat undefined courtPriority as "no priority list" — degrades to the
+  // safety-net-only path (every court tried in dropdown order).
+  const priorityCourts = options.courtPriority ?? [];
 
   const result: BookingResult = {
     username: account.username,
     triggered_at,
-    court_attempted: account.court,
+    court_attempted: priorityCourts[0] ?? account.court ?? '',
     court_booked: null,
     slot: account.slot,
     status: 'ERROR',
@@ -453,6 +498,7 @@ export async function bookOneAccount(
     // The engine has already submitted login and pre-selected (court, slot).
     // Replace our dummy page with the prewarmed one, then verify state. Skip
     // the entire login block below.
+    let prewarmedCourtLabel: string | null = null;
     if (deepPrewarmed) {
       page = options.prewarmedBookingPage!;
       if (!page.url().includes('booking.php')) {
@@ -478,13 +524,18 @@ export async function bookOneAccount(
         .textContent()
         .then((t) => (t ?? '').trim())
         .catch(() => null);
+      prewarmedCourtLabel = selectedCourtLabel;
       const selectedSlotValue = await page
         .locator('#time')
         .inputValue()
         .catch(() => null);
-      if (selectedCourtLabel !== account.court || selectedSlotValue !== account.slot) {
+      // "Expected" court is the first priority entry — what the engine aimed
+      // for with no alt-court override. Drift against this is the actionable
+      // signal: alt-court selections legitimately differ and aren't drift.
+      const expectedCourt = priorityCourts[0] ?? '';
+      if (selectedCourtLabel !== expectedCourt || selectedSlotValue !== account.slot) {
         result.attempts.push({
-          court: account.court,
+          court: expectedCourt,
           slot: account.slot,
           outcome: 'submit-fail',
           reason: `deep-prewarm state drift: court=${selectedCourtLabel} slot=${selectedSlotValue}`,
@@ -548,10 +599,15 @@ export async function bookOneAccount(
       const tFetchDp = Date.now();
       reservedByValue = await fetchAllReservedTimes(page, courtValues);
       console.log(`[perf] ${account.username} fetch_reserved=${Date.now() - tFetchDp}ms`);
-      const assignedCourt = allBadmintonCourts.find((c) => c.label === account.court);
-      if (assignedCourt) {
+      // The pre-warmed court is whatever the engine committed to the dropdown
+      // (could be COURTS[0] or an alt-court with the slot open). Read it back
+      // instead of guessing from account.court (now deprecated/optional).
+      const prewarmedCourt = prewarmedCourtLabel
+        ? allBadmintonCourts.find((c) => c.label === prewarmedCourtLabel)
+        : undefined;
+      if (prewarmedCourt) {
         // Reserved = ALL_SLOTS minus what's currently visible in the dropdown.
-        reservedByValue.set(assignedCourt.value, ALL_SLOTS.filter((s) => !liveSlotOptions.includes(s)));
+        reservedByValue.set(prewarmedCourt.value, ALL_SLOTS.filter((s) => !liveSlotOptions.includes(s)));
       }
     } else {
       const tFetchStd = Date.now();
@@ -568,7 +624,7 @@ export async function bookOneAccount(
 
     // ---- Retry-with-fallback loop ----
     const deadline = Date.now() + deadlineMs;
-    const courtsToTry = prioritizeCourts(account.court, allBadmintonCourts);
+    const courtsToTry = buildCourtPriority(priorityCourts, allBadmintonCourts);
 
     let booked: { court: string; slot: string } | null = null;
     let earlyExit: 'already-booked' | null = null;
@@ -581,7 +637,7 @@ export async function bookOneAccount(
     // of `account.court` to avoid double-submitting.
     let deepAttempted = false;
 
-    // ---- Deep-prewarm fast-confirm: try assigned (court, slot) FIRST ----
+    // ---- Deep-prewarm fast-confirm: try the pre-warmed (court, slot) FIRST ----
     // The pre-warm engine has already selected these dropdowns and verified the
     // dropdown state. attemptSubmitBooking will (re-)select and click submit
     // without navigating, so the operation completes in ~tens of milliseconds.
@@ -589,7 +645,12 @@ export async function bookOneAccount(
     // existing retry-with-fallback loop, which re-queries /get_reserved_times
     // and tries fallback courts — this is the late-fallback safety net.
     if (deepPrewarmed && result.attempts.length === 0) {
-      const assignedCourt = allBadmintonCourts.find((c) => c.label === account.court);
+      // Fast-confirm targets whichever court the engine committed to (could be
+      // COURTS[0] or an alt-court). Read it back from the dropdown instead of
+      // guessing from the deprecated `account.court` field.
+      const assignedCourt = prewarmedCourtLabel
+        ? allBadmintonCourts.find((c) => c.label === prewarmedCourtLabel)
+        : undefined;
       if (assignedCourt) {
         deepAttempted = true;
         if (options.dryRun) {
@@ -665,22 +726,24 @@ export async function bookOneAccount(
     }
 
     outer: for (const court of courtsToTry) {
-      // Skip the assigned court if fast-confirm already attempted it.
-      if (deepAttempted && court.label === account.court) continue;
+      // Skip the priority[0] court if fast-confirm already attempted it.
+      // (With the old per-account court field this compared to account.court;
+      // now the "assigned" court is the first entry in COURT_PRIORITY.)
+      if (deepAttempted && court.label === priorityCourts[0]) continue;
       // Skip if fast-confirm already resolved (success / already-booked).
       if (booked || earlyExit) break;
       if (Date.now() >= deadline) break;
 
       const available = availableByValue.get(court.value) ?? [];
 
-      // Grace retry for assigned court when the /get_reserved_times snapshot
-      // says all slots are taken — but the server-side fairness reset may
-      // have completed between snapshot and now. One more submit within
-      // MAX_GRACE_MS catches the clock-skew window on the assigned court.
-      // (For non-assigned courts we have no slot to retry with, so skip.)
+      // Grace retry for the priority[0] court when the /get_reserved_times
+      // snapshot says all slots are taken — but the server-side fairness reset
+      // may have completed between snapshot and now. One more submit within
+      // MAX_GRACE_MS catches the clock-skew window on the priority court.
+      // (For other courts we still retry the same account.slot — see below.)
       if (
         available.length === 0 &&
-        court.label === account.court &&
+        court.label === priorityCourts[0] &&
         Date.now() - start < MAX_GRACE_MS
       ) {
         if (!onBookingPage) {
@@ -720,58 +783,52 @@ export async function bookOneAccount(
         continue;
       }
 
-      // Slot priority: assigned first, then reverse chronological order
-      // (21:30_22:30 → 16:30_17:30) for any other available slots on this
-      // court. Matches user preference for back-to-front priority within a
-      // court.
-      const reversedAllSlots = ['21:30_22:30', '20:30_21:30', '19:30_20:30', '18:30_19:30', '17:30_18:30', '16:30_17:30'];
-      const slotOrder = [
-        account.slot,
-        ...reversedAllSlots.filter((s) => s !== account.slot && available.includes(s)),
-      ];
+      // Per user direction: only the account's own slot is attempted within any
+      // court. No per-court slot fallback — if my slot isn't available here, we
+      // move on to the next priority court (or fail at the end if all are full).
+      const slot = account.slot;
+      if (!available.includes(slot)) {
+        result.attempts.push({ court: court.label, slot, outcome: 'slot-not-available' });
+        continue;
+      }
 
-      for (const slot of slotOrder) {
-        if (Date.now() >= deadline) break;
-        if (!available.includes(slot)) continue;
+      if (options.dryRun) {
+        result.attempts.push({ court: court.label, slot, outcome: 'dry-run-would-book' });
+        booked = { court: court.label, slot };
+        break outer;
+      }
 
-        if (options.dryRun) {
-          result.attempts.push({ court: court.label, slot, outcome: 'dry-run-would-book' });
-          booked = { court: court.label, slot };
-          break outer;
-        }
-
-        // Real path: selectOption(court) + selectOption(slot) + submit. Race-loss
-        // with a parallel account is caught by the 3s selectOption timeout — the
-        // dropdown won't include the slot, so we skip and try the next (court, slot).
-        if (!onBookingPage) {
-          await resetToBookingPage(page);
-          onBookingPage = true;
-        }
-        const outcome = await attemptSubmitBooking(page, court, slot);
-        if (outcome.type === 'success') {
-          result.attempts.push({ court: court.label, slot, outcome: 'success' });
-          booked = { court: court.label, slot };
-          break outer;
-        }
-        if (outcome.type === 'already-booked') {
-          result.attempts.push({
-            court: court.label,
-            slot,
-            outcome: 'submit-fail',
-            reason: 'already-booked',
-          });
-          earlyExit = 'already-booked';
-          break outer;
-        }
+      // Real path: selectOption(court) + selectOption(slot) + submit. Race-loss
+      // with a parallel account is caught by the 3s selectOption timeout — the
+      // dropdown won't include the slot, so we skip and try the next (court, slot).
+      if (!onBookingPage) {
+        await resetToBookingPage(page);
+        onBookingPage = true;
+      }
+      const outcome = await attemptSubmitBooking(page, court, slot);
+      if (outcome.type === 'success') {
+        result.attempts.push({ court: court.label, slot, outcome: 'success' });
+        booked = { court: court.label, slot };
+        break outer;
+      }
+      if (outcome.type === 'already-booked') {
         result.attempts.push({
           court: court.label,
           slot,
           outcome: 'submit-fail',
-          reason: outcome.type === 'submit-fail' ? outcome.reason : undefined,
+          reason: 'already-booked',
         });
-        // submit-fail (race or other) — page is now off booking.php, must reset
-        onBookingPage = false;
+        earlyExit = 'already-booked';
+        break outer;
       }
+      result.attempts.push({
+        court: court.label,
+        slot,
+        outcome: 'submit-fail',
+        reason: outcome.type === 'submit-fail' ? outcome.reason : undefined,
+      });
+      // submit-fail (race or other) — page is now off booking.php, must reset
+      onBookingPage = false;
     }
 
     // ---- Result classification ----
@@ -797,13 +854,25 @@ export async function bookOneAccount(
     }
 
     // Exhausted all (court, slot) combinations within deadline.
-    const triedLabels = courtsToTry
-      .filter((c) => (availableByValue.get(c.value)?.length ?? 0) === 0)
-      .map((c) => `${c.label}: no slots`);
-    const trail = triedLabels.length > 0 ? ` tried: ${triedLabels.slice(0, 6).join(', ')}` : '';
-    result.status = 'FAIL';
-    result.fail_reason = `no available (court, slot) within ${Math.round(deadlineMs / 1000)}s${trail}`;
-    result.court_attempted = account.court;
+    // Distinguish "slot reserved on every court" (the new invariant violation)
+    // from a generic "no (court, slot) pair available" — the former is a
+    // clearer signal for the user and matches the deep-prewarm abort reason.
+    const slotTakenEverywhere = courtsToTry.every(
+      (c) => !(availableByValue.get(c.value) ?? []).includes(account.slot)
+    );
+    if (slotTakenEverywhere) {
+      result.status = 'FAIL';
+      result.fail_reason = `slot ${account.slot} ไม่ว่างในทุกสนาม (priority + safety net exhausted)`;
+      result.court_attempted = priorityCourts[0] ?? account.court ?? '';
+    } else {
+      const triedLabels = courtsToTry
+        .filter((c) => (availableByValue.get(c.value)?.length ?? 0) === 0)
+        .map((c) => `${c.label}: no slots`);
+      const trail = triedLabels.length > 0 ? ` tried: ${triedLabels.slice(0, 6).join(', ')}` : '';
+      result.status = 'FAIL';
+      result.fail_reason = `no available (court, slot) within ${Math.round(deadlineMs / 1000)}s${trail}`;
+      result.court_attempted = priorityCourts[0] ?? account.court ?? '';
+    }
     if (!options.dryRun) await shoot(page, screenshot);
     return result;
   } catch (err) {

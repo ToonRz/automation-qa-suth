@@ -6,7 +6,7 @@
 import { chromium, Browser, BrowserContext, Page } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
-import accounts from '../config/accounts.json';
+import { getConfig } from './server/configLoader';
 
 const LOGIN_URL = 'https://susport.sc.su.ac.th/login.php';
 
@@ -14,7 +14,7 @@ const LOGIN_URL = 'https://susport.sc.su.ac.th/login.php';
 // Use a fresh account (one that hasn't booked today) to avoid the 1-per-day rule.
 const accountArg = process.argv.find(a => a.startsWith('--account='));
 const ACCOUNT_INDEX = accountArg ? parseInt(accountArg.split('=')[1], 10) : 1; // default to account #2 (fresh)
-const ACCOUNT = accounts[ACCOUNT_INDEX];
+const ACCOUNT = getConfig().accounts[ACCOUNT_INDEX];
 
 const SCREENSHOTS_DIR = path.resolve(__dirname, '..', 'screenshots');
 const REPORT_PATH = path.resolve(__dirname, '..', 'reports', 'slots-discovered.json');

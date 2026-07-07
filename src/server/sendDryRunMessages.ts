@@ -75,21 +75,23 @@ function formatSummaryForOwner(allResults: { user: string; accounts: AccountResu
 }
 
 // ---- mirror of sendPrewarmNoticesForBooking() message body (owner users only) ----
+// After the slot-first / court-priority-second refactor, per-account `court`
+// is vestigial — the helper groups by slot to reflect the actual invariant.
 
 function buildPrewarmText(
   ownerDisplayName: string,
-  ownerAccounts: Array<{ username: string; court: string; slot: string }>,
+  ownerAccounts: Array<{ username: string; slot: string }>,
   fireTime: Date,
   cronFireAt: Date
 ): string {
-  const byCourt = new Map<string, typeof ownerAccounts>();
+  const bySlot = new Map<string, typeof ownerAccounts>();
   for (const acc of ownerAccounts) {
-    const list = byCourt.get(acc.court) ?? [];
+    const list = bySlot.get(acc.slot) ?? [];
     list.push(acc);
-    byCourt.set(acc.court, list);
+    bySlot.set(acc.slot, list);
   }
-  for (const list of byCourt.values()) {
-    list.sort((a, b) => a.slot.localeCompare(b.slot));
+  for (const list of bySlot.values()) {
+    list.sort((a, b) => a.username.localeCompare(b.username));
   }
 
   const fmtTime = (d: Date): string => d.toTimeString().slice(0, 8);
@@ -105,15 +107,15 @@ function buildPrewarmText(
   lines.push(`⏳ เหลืออีก ${leadMin} นาที`);
   lines.push('');
   lines.push(`🎯 แผนจอง:`);
-  for (const [court, accounts] of byCourt) {
-    lines.push(`   🏸 ${court} (${accounts.length} คิว)`);
+  for (const [slot, accounts] of bySlot) {
+    lines.push(`   🕒 ${fmtSlot(slot)} (${accounts.length} คิว)`);
     for (const acc of accounts) {
-      lines.push(`      • ${acc.username} · ${fmtSlot(acc.slot)}`);
+      lines.push(`      • ${acc.username}`);
     }
   }
   lines.push('');
   lines.push(`━━━━━━━━━━━━━━━━━━`);
-  lines.push(`🛠  [Login → เลือก court → เลือก slot → ยืนยัน]`);
+  lines.push(`🛠  [Login → เลือก court (priority) → เลือก slot → ยืนยัน]`);
   return lines.join('\n');
 }
 
@@ -191,7 +193,7 @@ async function main(): Promise<void> {
   const cronFireAt = new Date(fireTime.getTime() - 5 * 60_000);
   const prewarmText = buildPrewarmText(
     owner.display_name,
-    owner.accounts.map((a) => ({ username: a.username, court: a.court, slot: a.slot })),
+    owner.accounts.map((a) => ({ username: a.username, slot: a.slot })),
     fireTime,
     cronFireAt
   );
