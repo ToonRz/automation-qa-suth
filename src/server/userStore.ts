@@ -39,6 +39,11 @@ export interface User {
   accounts: Account[];
   // Runtime state — mutated by bot commands and scheduler.
   pending_booking?: boolean;
+  // Per-user noon-cron opt-out. `undefined` and `true` both mean "booked at
+  // 12:00 normally"; only an explicit `false` (set via /cron off) skips the
+  // user at fire time. Defaults to undefined on disk so older users.json
+  // files keep working without migration.
+  cron_enabled?: boolean;
   last_result?: {
     triggered_at: string;
     accounts: AccountResult[];
@@ -106,6 +111,26 @@ export function markPending(chatId: number, pending: boolean): void {
   save(data);
 }
 
+/** Per-user noon-cron opt-out. Mirrors markPending: read-modify-write without
+ *  retry — if a concurrent write (bot handler vs scheduler tick) loses the
+ *  toggle, the user re-runs /cron and it sticks. Persisted via the same
+ *  atomic temp+rename save() so the file is never partially written. */
+export function setCronEnabled(chatId: number, enabled: boolean): void {
+  const data = load();
+  const user = data.users.find((u) => u.chat_id === chatId);
+  if (!user) return;
+  user.cron_enabled = enabled;
+  save(data);
+}
+
+/** Default-on: missing/undefined flag means cron runs. Only an explicit false
+ *  (set by /cron off) opts the user out. */
+export function isCronEnabled(chatId: number): boolean {
+  const user = load().users.find((u) => u.chat_id === chatId);
+  if (!user) return true;
+  return user.cron_enabled !== false;
+}
+
 export function setLastResult(
   chatId: number,
   result: { triggered_at: string; accounts: AccountResult[] }
@@ -132,6 +157,60 @@ export function addAccountToUser(chatId: number, account: Account): void {
   }
   user.accounts.push(account);
   save(data);
+}
+
+/** Update mutable fields on an existing account (court and/or slot). Throws if
+ *  the user or account is not found. Username/password are not editable here
+ *  — use /cancel + /add if those need to change. Used by the /useredit wizard
+ *  in bot.ts.
+ *  Patch is a Partial<Pick<Account, 'court' | 'slot'>>: callers pass only the
+ *  fields they want to change, the rest are preserved. */
+export function updateAccountInUser(
+  chatId: number,
+  username: string,
+  patch: Partial<Pick<Account, 'court' | 'slot'>>
+): void {
+  const data = load();
+  const user = data.users.find((u) => u.chat_id === chatId);
+  if (!user) {
+    throw new Error(`user with chat_id=${chatId} not found`);
+  }
+  const account = user.accounts.find((a) => a.username === username);
+  if (!account) {
+    throw new Error(`account with username="${username}" not found for this user`);
+  }
+  if (patch.court !== undefined) account.court = patch.court;
+  if (patch.slot !== undefined) account.slot = patch.slot;
+  save(data);
+}
+
+/** Register a new Telegram user. Throws on duplicate chat_id or telegram_id, or
+ *  if there is already an owner when caller tries to add another owner. Used by
+ *  the /user add wizard in bot.ts.
+ *  Owner-only invariant: at most one owner in the system (the bot wires
+ *  owner-only logic around getOwner()). Allowing multiple owners would break
+ *  sendPrewarmNoticeToOwner() and the cross-user summary DM. */
+export function addUser(input: Omit<User, 'accounts' | 'pending_booking' | 'last_result'>): User {
+  const data = load();
+  if (data.users.some((u) => u.chat_id === input.chat_id)) {
+    throw new Error(`user with chat_id=${input.chat_id} already exists`);
+  }
+  if (data.users.some((u) => u.telegram_id === input.telegram_id)) {
+    throw new Error(`user with telegram_id=${input.telegram_id} already exists`);
+  }
+  if (input.role === 'owner' && data.users.some((u) => u.role === 'owner')) {
+    throw new Error(`owner already exists (chat_id=${data.users.find((u) => u.role === 'owner')!.chat_id}); cannot add a second owner`);
+  }
+  const newUser: User = {
+    telegram_id: input.telegram_id,
+    chat_id: input.chat_id,
+    display_name: input.display_name,
+    role: input.role,
+    accounts: [],
+  };
+  data.users.push(newUser);
+  save(data);
+  return newUser;
 }
 
 /** Test helper — clear in-memory cache so file edits are picked up. */

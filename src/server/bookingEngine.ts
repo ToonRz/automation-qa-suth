@@ -25,7 +25,15 @@
 // Each account's prewarmed context has its OWN browser context (BR-01/02).
 
 import { Browser, BrowserContext, Page, chromium } from 'playwright';
-import { bookOneAccount, Account, BookingResult, FlowOptions } from '../bookingFlow';
+import {
+  bookOneAccount,
+  Account,
+  BookingResult,
+  FlowOptions,
+  getBadmintonCourts,
+  fetchAllReservedTimes,
+  prioritizeCourts,
+} from '../bookingFlow';
 import { getServerNow } from '../timeSync';
 
 const LOGIN_URL = 'https://susport.sc.su.ac.th/login.php';
@@ -192,9 +200,26 @@ async function prewarmContextsDeep(
           // 'already booked today (reservations.php after login)' FAIL.
           return { account, context, page, status: 'needs-standard', error: 'reservations.php after login' };
         }
-        // 2. Select court dropdown
-        await page.locator('select#court').selectOption({ label: account.court });
-        // 3. Wait for the AJAX-driven #time dropdown to populate (more than the
+        // 2. Query all courts' availability at T-5min and pick the FIRST
+        // priority-ordered court where `account.slot` is open. If the assigned
+        // (court, slot) is soft-held by a pre-noon manual click, this avoids a
+        // wasted pre-select + lets the noon-tick fast-confirm target a court
+        // that's actually open. Falls back to the assigned court if no alt is
+        // found — in that case the existing selectOption below is the original
+        // behavior, and the grace retry in bookOneAccount handles server-side
+        // fairness-reset skew at T+0.
+        const allCourts = await getBadmintonCourts(page);
+        const courtValues = allCourts.map((c) => c.value);
+        const reservedMap = await fetchAllReservedTimes(page, courtValues);
+        const prioritizedCourts = prioritizeCourts(account.court, allCourts);
+        const altCourt = prioritizedCourts.find((c) => {
+          const reserved = reservedMap.get(c.value) ?? [];
+          return !reserved.includes(account.slot);
+        }) ?? prioritizedCourts[0];
+        const targetCourtLabel = altCourt?.label ?? account.court;
+        // 3. Select court dropdown (assigned OR alt with same slot)
+        await page.locator('select#court').selectOption({ label: targetCourtLabel });
+        // 4. Wait for the AJAX-driven #time dropdown to populate (more than the
         // default placeholder option). On timeout the slot is unavailable OR
         // the page never hydrated — fall through to standard mode.
         await page.waitForFunction(
@@ -204,7 +229,7 @@ async function prewarmContextsDeep(
           },
           { timeout: 5000 },
         );
-        // 4. Select slot dropdown
+        // 5. Select slot dropdown
         await page.locator('select#time').selectOption({ value: account.slot });
         return { account, context, page, status: 'page-ready' };
       } catch (err: unknown) {
@@ -280,9 +305,44 @@ export async function runWithDeepPrewarm(
     // Phase 2: spin to the exact tick (server-synced clock).
     await spinUntil(targetTime.getTime());
     const firedAt = new Date();
+    const driftMs = firedAt.getTime() - targetTime.getTime();
+
+    // Drift guard: if the engine woke up well past the fire time, the slot
+    // race is already lost (other bots have claimed the (court, slot) pairs).
+    // Skip the dispatch instead of wasting 30s probing for doomed attempts.
+    // Seen on 2026-07-06: friend task drifted 69s past fire after waiting for
+    // owner dispatch to complete in the sequential loop at bot.ts:1386, then
+    // every probe timed out. This guard turns that into a surfaced FAIL with
+    // a clear reason, instead of a "no available within 30s" mystery.
+    const DEEP_PREWARM_DRIFT_SKIP_MS = 30_000;
+    if (driftMs > DEEP_PREWARM_DRIFT_SKIP_MS) {
+      console.warn(
+        `[bookingEngine] deep-prewarm SKIPPED (drift ${driftMs}ms > ` +
+          `${DEEP_PREWARM_DRIFT_SKIP_MS}ms threshold — slot race already lost)`
+      );
+      const missResults: BookingResult[] = accounts.map((account) => ({
+        username: account.username,
+        triggered_at: firedAt.toISOString(),
+        court_attempted: account.court,
+        court_booked: null,
+        slot: account.slot,
+        status: 'FAIL',
+        fail_reason: `missed-deadline: prewarm started ${driftMs}ms past fire time`,
+        screenshot: '',
+        duration_ms: 0,
+        attempts: [],
+      }));
+      return {
+        results: missResults,
+        mode: 'prewarm',
+        total_ms: Date.now() - start,
+        perAccount: contexts,
+      };
+    }
+
     console.log(
       `[bookingEngine] deep-prewarm FIRE at ${firedAt.toISOString()} ` +
-        `(target ${targetTime.toISOString()}, drift ${firedAt.getTime() - targetTime.getTime()}ms)`
+        `(target ${targetTime.toISOString()}, drift ${driftMs}ms)`
     );
 
     // Phase 3: per-account dispatch (mixed mode).

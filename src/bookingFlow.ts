@@ -30,7 +30,7 @@ export interface Account {
   username: string;
   password: string;
   court: string; // e.g. "แบดมินตัน1"
-  slot: string;  // e.g. "17:00_18:00"
+  slot: string;  // e.g. "17:30_18:30"
 }
 
 export interface AttemptRecord {
@@ -96,14 +96,30 @@ const DEFAULT_SCREENSHOTS_DIR = path.resolve(__dirname, '..', 'screenshots');
 const DEFAULT_RETRY_DEADLINE_MS = 30_000;
 const FALLBACK_COURT = 'แบดมินตัน4';
 
+/**
+ * Grace retry window for soft-hold slot recovery at T+0.
+ *
+ * Catches server clock skew (50-200ms) where the assigned slot's server-side
+ * fairness reset hasn't completed by the time the bot's fast-confirm clicks
+ * submit. A single retry within this window recovers the slot.
+ *
+ * Cost: ~150-200ms (one attemptSubmitBooking). Bounded to 200ms so the total
+ * per-account cost stays well under DEEP_PREWARM_DRIFT_SKIP_MS (30s) even when
+ * all 9 accounts hit the grace path.
+ *
+ * Set to 0 to disable.
+ */
+const MAX_GRACE_MS = 200;
+
 // All slot values available on the booking system (per discoverSlots finding).
 // Used to compute "available = ALL_SLOTS − reserved".
-const ALL_SLOTS = [
-  '17:00_18:00',
-  '18:00_19:00',
-  '19:00_20:00',
-  '20:00_21:00',
-  '21:00_22:00',
+export const ALL_SLOTS = [
+  '16:30_17:30',
+  '17:30_18:30',
+  '18:30_19:30',
+  '19:30_20:30',
+  '20:30_21:30',
+  '21:30_22:30',
 ];
 
 // Heuristic text indicators. These are brittle — if the site copy changes,
@@ -173,7 +189,7 @@ async function waitForSlotDropdown(page: Page, timeout = 10000): Promise<void> {
 }
 
 /** Returns all court dropdown entries with their backing values, filtered to badminton only. */
-async function getBadmintonCourts(page: Page): Promise<CourtInfo[]> {
+export async function getBadmintonCourts(page: Page): Promise<CourtInfo[]> {
   return await page.locator('#court').evaluate((el) => {
     const sel = el as HTMLSelectElement;
     return Array.from(sel.options)
@@ -200,7 +216,7 @@ async function getBadmintonCourts(page: Page): Promise<CourtInfo[]> {
  * NOTE: result is used as a BINARY HINT (skip courts with all slots reserved).
  * The actual slot list comes from the #time dropdown (see getDropdownSlots).
  */
-async function fetchAllReservedTimes(
+export async function fetchAllReservedTimes(
   page: Page,
   courtValues: string[]
 ): Promise<Map<string, string[]>> {
@@ -282,6 +298,7 @@ async function attemptSubmitBooking(
   court: CourtInfo,
   slot: string
 ): Promise<AttemptOutcome> {
+  const tStart = Date.now();
   try {
     await page.locator('#court').selectOption(court.value, { timeout: 3000 });
   } catch {
@@ -302,17 +319,21 @@ async function attemptSubmitBooking(
       { timeout: 3000 }
     ),
   ]).catch(() => null);
+  console.log(`[perf] attempt court=${court.label} slot=${slot} select_court_ajax=${Date.now() - tStart}ms`);
 
+  const tSelectSlot = Date.now();
   try {
     await page.locator('#time').selectOption(slot, { timeout: 3000 });
   } catch {
     return { type: 'submit-fail', reason: 'slot not in dropdown (race?)' };
   }
+  console.log(`[perf] attempt court=${court.label} slot=${slot} select_slot=${Date.now() - tSelectSlot}ms`);
 
   const submitBtn = page
     .locator('button:has-text("จอง"), input[type="submit"][value*="จอง" i]')
     .first();
 
+  const tSubmit = Date.now();
   try {
     await submitBtn.click({ timeout: 3000 });
   } catch {
@@ -320,6 +341,7 @@ async function attemptSubmitBooking(
   }
 
   await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => null);
+  console.log(`[perf] attempt court=${court.label} slot=${slot} submit=${Date.now() - tSubmit}ms`);
 
   const bodyText = (await page.locator('body').textContent()) ?? '';
 
@@ -368,7 +390,7 @@ async function resetToBookingPage(page: Page): Promise<void> {
 /**
  * Build priority-ordered court list: assigned → FALLBACK_COURT → other badminton courts.
  */
-function prioritizeCourts(assigned: string, available: CourtInfo[]): CourtInfo[] {
+export function prioritizeCourts(assigned: string, available: CourtInfo[]): CourtInfo[] {
   const priority: CourtInfo[] = [];
   const find = (label: string) => available.find((c) => c.label === label);
   const assignedCourt = find(assigned);
@@ -448,7 +470,7 @@ export async function bookOneAccount(
       // page.locator('#court').inputValue() returns the option's `value`
       // attribute (e.g. "2") — comparing the two is ALWAYS a phantom drift.
       // Confirmed via reports/slots-discovered.json: value="2" text="แบดมินตัน1".
-      // account.slot on the other hand is the option VALUE (e.g. "17:00_18:00"),
+      // account.slot on the other hand is the option VALUE (e.g. "17:30_18:30"),
       // matching the underscore format used in the AJAX response, so
       // inputValue() is the right comparison there.
       const selectedCourtLabel = await page
@@ -499,6 +521,8 @@ export async function bookOneAccount(
       return result;
     }
 
+    console.log(`[perf] ${account.username} login_end=${Date.now() - start}ms`);
+
     // ---- Parallel discovery: query all 6 courts in one round-trip ----
     // Computes BOTH (a) which courts have open slots AND (b) the per-court slot
     // list. With `date` included, the response matches what the page's own onchange
@@ -521,14 +545,18 @@ export async function bookOneAccount(
             .filter((v) => v && v !== ''),
         )
         .catch(() => [] as string[]);
+      const tFetchDp = Date.now();
       reservedByValue = await fetchAllReservedTimes(page, courtValues);
+      console.log(`[perf] ${account.username} fetch_reserved=${Date.now() - tFetchDp}ms`);
       const assignedCourt = allBadmintonCourts.find((c) => c.label === account.court);
       if (assignedCourt) {
         // Reserved = ALL_SLOTS minus what's currently visible in the dropdown.
         reservedByValue.set(assignedCourt.value, ALL_SLOTS.filter((s) => !liveSlotOptions.includes(s)));
       }
     } else {
+      const tFetchStd = Date.now();
       reservedByValue = await fetchAllReservedTimes(page, courtValues);
+      console.log(`[perf] ${account.username} fetch_reserved=${Date.now() - tFetchStd}ms`);
     }
 
     const availableByValue = new Map<string, string[]>();
@@ -595,7 +623,42 @@ export async function bookOneAccount(
               outcome: 'submit-fail',
               reason: outcome.type === 'submit-fail' ? outcome.reason : undefined,
             });
-            onBookingPage = false;
+
+            // Grace retry: server fairness reset may not have completed yet
+            // (clock skew 50-300ms). One more submit within MAX_GRACE_MS.
+            if (Date.now() - start < MAX_GRACE_MS) {
+              if (!onBookingPage) {
+                await resetToBookingPage(page);
+                onBookingPage = true;
+              }
+              const retryOutcome = await attemptSubmitBooking(page, assignedCourt, account.slot);
+              if (retryOutcome.type === 'success') {
+                result.attempts.push({
+                  court: assignedCourt.label,
+                  slot: account.slot,
+                  outcome: 'success',
+                });
+                booked = { court: assignedCourt.label, slot: account.slot };
+              } else if (retryOutcome.type === 'already-booked') {
+                result.attempts.push({
+                  court: assignedCourt.label,
+                  slot: account.slot,
+                  outcome: 'submit-fail',
+                  reason: 'grace-retry: already-booked',
+                });
+                earlyExit = 'already-booked';
+              } else {
+                result.attempts.push({
+                  court: assignedCourt.label,
+                  slot: account.slot,
+                  outcome: 'submit-fail',
+                  reason: `grace-retry: ${retryOutcome.type === 'submit-fail' ? retryOutcome.reason : 'unknown'}`,
+                });
+                onBookingPage = false;
+              }
+            } else {
+              onBookingPage = false;
+            }
           }
         }
       }
@@ -609,13 +672,63 @@ export async function bookOneAccount(
       if (Date.now() >= deadline) break;
 
       const available = availableByValue.get(court.value) ?? [];
+
+      // Grace retry for assigned court when the /get_reserved_times snapshot
+      // says all slots are taken — but the server-side fairness reset may
+      // have completed between snapshot and now. One more submit within
+      // MAX_GRACE_MS catches the clock-skew window on the assigned court.
+      // (For non-assigned courts we have no slot to retry with, so skip.)
+      if (
+        available.length === 0 &&
+        court.label === account.court &&
+        Date.now() - start < MAX_GRACE_MS
+      ) {
+        if (!onBookingPage) {
+          await resetToBookingPage(page);
+          onBookingPage = true;
+        }
+        const graceOutcome = await attemptSubmitBooking(page, court, account.slot);
+        if (graceOutcome.type === 'success') {
+          result.attempts.push({
+            court: court.label,
+            slot: account.slot,
+            outcome: 'success',
+          });
+          booked = { court: court.label, slot: account.slot };
+          break outer;
+        } else if (graceOutcome.type === 'already-booked') {
+          result.attempts.push({
+            court: court.label,
+            slot: account.slot,
+            outcome: 'submit-fail',
+            reason: 'already-booked',
+          });
+          earlyExit = 'already-booked';
+          break outer;
+        }
+        result.attempts.push({
+          court: court.label,
+          slot: account.slot,
+          outcome: 'submit-fail',
+          reason: `grace-retry: ${graceOutcome.type === 'submit-fail' ? graceOutcome.reason : 'unknown'}`,
+        });
+        onBookingPage = false;
+      }
+
       if (available.length === 0) {
         result.attempts.push({ court: court.label, slot: '-', outcome: 'no-slots-on-court' });
         continue;
       }
 
-      // Slot priority: assigned first, then any other available
-      const slotOrder = [account.slot, ...available.filter((s) => s !== account.slot)];
+      // Slot priority: assigned first, then reverse chronological order
+      // (21:30_22:30 → 16:30_17:30) for any other available slots on this
+      // court. Matches user preference for back-to-front priority within a
+      // court.
+      const reversedAllSlots = ['21:30_22:30', '20:30_21:30', '19:30_20:30', '18:30_19:30', '17:30_18:30', '16:30_17:30'];
+      const slotOrder = [
+        account.slot,
+        ...reversedAllSlots.filter((s) => s !== account.slot && available.includes(s)),
+      ];
 
       for (const slot of slotOrder) {
         if (Date.now() >= deadline) break;

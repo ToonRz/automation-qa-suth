@@ -49,7 +49,7 @@ async function main(): Promise<void> {
   );
 
   // Build the message locally with the same logic the helper uses, then send.
-  // Keeping this in sync with sendPrewarmNoticeToOwner() in bot.ts is verified
+  // Keeping this in sync with sendPrewarmNoticesForBooking() in bot.ts is verified
   // by source-level assertions in Phase 2 — if the production helper diverges,
   // those assertions fail.
   //
@@ -91,36 +91,35 @@ async function main(): Promise<void> {
   // that change indentation or add intermediate blocks.
   const funcBody = extractFuncBody(
     botSrc,
-    /async function sendPrewarmNoticeToOwner\s*\(/
+    /async function sendPrewarmNoticesForBooking\s*\(/
   );
   if (!funcBody) {
-    console.error('❌ could not locate sendPrewarmNoticeToOwner in bot.ts');
+    console.error('❌ could not locate sendPrewarmNoticesForBooking in bot.ts');
     process.exit(1);
   }
 
-  // (a) M1 fix — 0-accounts guard is present in the helper.
-  const hasGuard = /accounts\.length\s*===\s*0/.test(funcBody);
+  // (a) M1 fix — skip-if-empty guard is present at the top of the helper
+  // (replaces the old per-user 0-accounts guard, since the caller now
+  // filters out 0-account users before passing the array in).
+  const hasSkipIfEmptyGuard = /users\.length\s*===\s*0/.test(funcBody);
   console.log(
-    `  ${hasGuard ? '✅' : '❌'} M1: 0-accounts guard present in helper`
+    `  ${hasSkipIfEmptyGuard ? '✅' : '❌'} M1: skip-if-empty guard present in helper`
   );
 
-  // (b) B1 fix — `try {` must appear BEFORE the actual `getOwner()` call so
-  // a synchronous throw from getOwner() (e.g., malformed users.json) is
-  // caught. Match the call site `const owner = getOwner();` specifically
-  // to avoid false-matching mentions in JSDoc/comments above the function.
+  // (b) B1 fix — outer try-block wraps the loop and any throws from
+  // getAllUsers()/sendTelegramMessage are caught.
   const tryIdx = funcBody.indexOf('try {');
-  const getOwnerCallIdx = funcBody.indexOf('const owner = getOwner();');
-  const wrapsBody =
-    tryIdx >= 0 && getOwnerCallIdx >= 0 && tryIdx < getOwnerCallIdx;
+  const loopIdx = funcBody.indexOf('for (const user of users)');
+  const wrapsBody = tryIdx >= 0 && loopIdx >= 0 && tryIdx < loopIdx;
   console.log(
-    `  ${wrapsBody ? '✅' : '❌'} B1: try-block wraps getOwner() ` +
-      `(try@${tryIdx} call@${getOwnerCallIdx})`
+    `  ${wrapsBody ? '✅' : '❌'} B1: try-block wraps the per-user loop ` +
+      `(try@${tryIdx} loop@${loopIdx})`
   );
 
   // (c) N1 fix — helper takes `fireTime: Date` as a parameter, so the
   // 11:55:00 / 12:00:00 strings and the "5 นาที" lead are not hardcoded
   // inside the message.
-  const takesFireTime = /sendPrewarmNoticeToOwner\([^)]*fireTime\s*:\s*Date/.test(
+  const takesFireTime = /sendPrewarmNoticesForBooking\([^)]*fireTime\s*:\s*Date/.test(
     funcBody
   );
   const noHardcodedTimes =
@@ -138,7 +137,7 @@ async function main(): Promise<void> {
   // constant `5 * 60_000` is GONE from the helper (the duration now flows
   // from the difference between the two Date params).
   const takesCronFireAt =
-    /sendPrewarmNoticeToOwner\([^)]*cronFireAt\s*:\s*Date/.test(funcBody);
+    /sendPrewarmNoticesForBooking\([^)]*cronFireAt\s*:\s*Date/.test(funcBody);
   const noHardcodedLead = !/5\s*\*\s*60_000/.test(funcBody);
   console.log(
     `  ${takesCronFireAt ? '✅' : '❌'} L1.a: helper accepts cronFireAt: Date param`
@@ -157,22 +156,24 @@ async function main(): Promise<void> {
     `  ${hasByCourt ? '✅' : '❌'} new: byCourt grouping present`
   );
 
-  // (f) Caller-side assertion — caller passes BOTH args. Scoped to a single
-  // line containing `void sendPrewarmNoticeToOwner(` to avoid false matches.
+  // (f) Caller-side assertion — caller passes the recipient array as the
+  // first arg and (fireTime, new Date()) as the time args. Scoped to a
+  // single line containing `void sendPrewarmNoticesForBooking(` to avoid
+  // false matches.
   const callerLineMatch = botSrc.match(
-    /^.*void sendPrewarmNoticeToOwner\([^)]*\).*$/m
+    /^.*void sendPrewarmNoticesForBooking\([^)]*\).*$/m
   );
-  const callerPassesTwoArgs =
+  const callerPassesCorrectArgs =
     callerLineMatch !== null &&
-    /void sendPrewarmNoticeToOwner\(\s*fireTime\s*,\s*new Date\(\)\s*\)/.test(
+    /void sendPrewarmNoticesForBooking\(\s*prewarmRecipients\s*,\s*fireTime\s*,\s*new Date\(\)\s*\)/.test(
       callerLineMatch[0]
     );
   console.log(
-    `  ${callerPassesTwoArgs ? '✅' : '❌'} caller: passes (fireTime, new Date())`
+    `  ${callerPassesCorrectArgs ? '✅' : '❌'} caller: passes (prewarmRecipients, fireTime, new Date())`
   );
 
   if (
-    !hasGuard ||
+    !hasSkipIfEmptyGuard ||
     !wrapsBody ||
     !takesFireTime ||
     !noHardcodedTimes ||
@@ -180,7 +181,7 @@ async function main(): Promise<void> {
     !noHardcodedLead ||
     !hasBreakdownHeader ||
     !hasByCourt ||
-    !callerPassesTwoArgs
+    !callerPassesCorrectArgs
   ) {
     console.error('❌ Source-level assertions failed');
     process.exit(1);
@@ -207,7 +208,7 @@ function nextNoonLocal(): Date {
   return target;
 }
 
-/** Mirror of sendPrewarmNoticeToOwner's message-building logic, factored out
+/** Mirror of sendPrewarmNoticesForBooking's message-building logic, factored out
  *  for direct test invocation. Kept in sync by source-level assertions above. */
 function buildPrewarmText(
   owner: { display_name: string; accounts: Array<{ username: string; court: string; slot: string }> },

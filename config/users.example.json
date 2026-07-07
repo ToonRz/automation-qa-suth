@@ -6,9 +6,9 @@
       "display_name": "ณราวิชญ์ (Owner)",
       "role": "owner",
       "accounts": [
-        { "username": "650910088", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "17:00_18:00" },
-        { "username": "671211370", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "18:00_19:00" },
-        { "username": "670910322", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "19:00_20:00" }
+        { "username": "650910088", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "17:30_18:30" },
+        { "username": "671211370", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "18:30_19:30" },
+        { "username": "670910322", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "19:30_20:30" }
       ]
     },
     {
@@ -17,7 +17,7 @@
       "display_name": "เพื่อน A",
       "role": "friend",
       "accounts": [
-        { "username": "671211170", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "20:00_21:00" }
+        { "username": "671211170", "password": "REPLACE_ME", "court": "แบดมินตัน1", "slot": "20:30_21:30" }
       ]
     }
   ]

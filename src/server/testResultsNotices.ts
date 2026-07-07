@@ -91,7 +91,7 @@ function fakeResults(): AccountResult[] {
     {
       username: '670910088',
       court: 'แบดมินตัน1',
-      slot: '17:00_18:00',
+      slot: '17:30_18:30',
       status: 'PASS',
       fail_reason: null,
       court_booked: 'แบดมินตัน1',
@@ -100,7 +100,7 @@ function fakeResults(): AccountResult[] {
     {
       username: '670910321',
       court: 'แบดมินตัน1',
-      slot: '18:00_19:00',
+      slot: '18:30_19:30',
       status: 'FAIL',
       fail_reason: 'ทั้ง 2 สนามเต็ม',
       court_booked: null,
@@ -109,7 +109,7 @@ function fakeResults(): AccountResult[] {
     {
       username: '670910478',
       court: 'แบดมินตัน4',
-      slot: '19:00_20:00',
+      slot: '19:30_20:30',
       status: 'PASS',
       fail_reason: null,
       court_booked: 'แบดมินตัน4',
@@ -118,7 +118,7 @@ function fakeResults(): AccountResult[] {
     {
       username: '670911373',
       court: 'แบดมินตัน1',
-      slot: '21:00_22:00',
+      slot: '21:30_22:30',
       status: 'ERROR',
       fail_reason: 'page.goto timeout 20000ms',
       court_booked: null,
@@ -166,7 +166,7 @@ async function main(): Promise<void> {
         {
           username: 'friend_acct_1',
           court: 'แบดมินตัน2',
-          slot: '16:00_17:00',
+          slot: '16:30_17:30',
           status: 'PASS',
           fail_reason: null,
           court_booked: 'แบดมินตัน2',
