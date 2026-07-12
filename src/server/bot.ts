@@ -1567,7 +1567,18 @@ async function startPollingLoop(): Promise<void> {
   // eslint-disable-next-line no-constant-condition
   while (true) {
     try {
-      const url = `${apiBase}/getUpdates?timeout=25&offset=${offset}`;
+      // Shorter long-poll around the noon fire window (11:55-12:01) so the
+      // undici in-flight request frees the event loop faster — the cron
+      // fires at 11:55 and runScheduledBooking launches browser contexts at
+      // 12:00 sharp. A 25s long-poll could hold a connection from the wrong
+      // tick and slow outbound sendMessage calls just as results need to DM
+      // users. Outside that window we use the normal 25s timeout to reduce
+      // idle getUpdates traffic.
+      const nowMs = Date.now();
+      const noonMs = nextNoon(new Date(nowMs)).getTime();
+      const msToNoon = noonMs - nowMs;
+      const pollTimeout = msToNoon > 0 && msToNoon <= 6 * 60_000 ? 5 : 25;
+      const url = `${apiBase}/getUpdates?timeout=${pollTimeout}&offset=${offset}`;
       const res = await fetch(url, { method: 'GET' });
       if (!res.ok) {
         throw new Error(`getUpdates HTTP ${res.status}`);

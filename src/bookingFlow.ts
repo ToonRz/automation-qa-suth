@@ -181,9 +181,13 @@ function ensureDir(dir: string) {
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
 }
 
-async function shoot(page: Page, filePath: string): Promise<void> {
+async function shoot(page: Page, filePath: string, fullPage = false): Promise<void> {
   ensureDir(path.dirname(filePath));
-  await page.screenshot({ path: filePath, fullPage: true });
+  // Default = viewport-only screenshot (~150-400KB). fullPage screenshot pulls
+  // the entire rendered body (~2-5MB) and dominates disk I/O at end-of-run for
+  // 9 accounts. We keep fullPage available as an opt-in for the ERROR path so
+  // a thrown exception's full stack context is preserved.
+  await page.screenshot({ path: filePath, fullPage });
 }
 
 /**
@@ -397,11 +401,30 @@ async function attemptSubmitBooking(
  * Navigate back to the booking page so the next attempt starts from a clean state.
  * After a submit, the server may redirect to a confirmation page; without this,
  * re-selecting a court would target the wrong page.
+ *
+ * Perf: prefer `history.back()` (no network round-trip when the previous entry
+ * in the tab's history is booking.php — typical after a submit-fail since
+ * attemptSubmitBooking lands us on the post-submit confirm/failure page).
+ * Falls back to `page.goto(BOOKING_URL)` if back doesn't land on booking.php
+ * within 1.5s or the #court selector doesn't appear. Net effect on the retry
+ * loop: ~1-3s saved per race-loss × N race-loss accounts.
  */
 async function resetToBookingPage(page: Page): Promise<void> {
-  if (!page.url().includes('booking.php')) {
-    await page.goto(BOOKING_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
+  if (page.url().includes('booking.php')) return;
+
+  // Soft path — back-nav to booking.php if we can confirm it within 1.5s.
+  try {
+    await page.goBack({ waitUntil: 'domcontentloaded', timeout: 1500 });
+    if (page.url().includes('booking.php')) {
+      await page.waitForSelector('#court', { timeout: 2000 });
+      return;
+    }
+  } catch {
+    /* goBack timed out or no history entry — fall through to goto */
   }
+
+  // Hard path — full re-navigation. Same semantics as before this optimization.
+  await page.goto(BOOKING_URL, { waitUntil: 'domcontentloaded', timeout: 15000 });
   await page.waitForSelector('#court', { timeout: 10000 });
 }
 
@@ -880,7 +903,9 @@ export async function bookOneAccount(
     result.fail_reason = `${err}`;
     if (page && !options.dryRun) {
       try {
-        await shoot(page, screenshot);
+        // fullPage on ERROR — exception context (stack trace, console errors)
+        // may render far below the fold and the post-mortem author needs it.
+        await shoot(page, screenshot, true);
       } catch {
         /* ignore */
       }
