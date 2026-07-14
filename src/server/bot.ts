@@ -49,6 +49,7 @@ import {
 } from './userStore';
 import { runWithPrewarm, runWithDeepPrewarm, EngineResult } from './bookingEngine';
 import { sendTelegramMessage } from './telegramSend';
+import { syncServerTime } from '../timeSync';
 
 dotenv.config();
 
@@ -1493,6 +1494,20 @@ async function main() {
   console.log('=== Court Booking Bot ===');
   console.log(`Telegram token: ${TOKEN!.slice(0, 10)}...`);
   console.log(`Registered users: ${getAllUsers().length}`);
+
+  // Sync server time before scheduling. The bot runs as a separate process from
+  // the scheduler (npm start), so it needs its own offset. Without this, the
+  // spin-wait inside runWithPrewarm/DeepPrewarm uses getServerNow() against a
+  // target computed from local Date.now() — server-fire lands skewed by however
+  // far the local clock has drifted from the susport server.
+  try {
+    const offsetMs = await syncServerTime(5);
+    const sign = offsetMs >= 0 ? '+' : '';
+    console.log(`✓ Server time offset: ${sign}${offsetMs}ms (local vs server)`);
+  } catch (err) {
+    console.warn(`⚠️  Time sync failed: ${err}`);
+    console.warn(`   Continuing with local clock — clock skew risk`);
+  }
 
   // Eager reachability check — fail fast with a useful message if the bot
   // can't talk to Telegram from this host (e.g. IPv6-only paths blocked).
