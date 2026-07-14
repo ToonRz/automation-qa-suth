@@ -1306,6 +1306,21 @@ async function sendPrewarmNoticesForBooking(
 }
 
 async function runScheduledBooking(): Promise<void> {
+  // Re-sync server time at the top of each noon run. The boot-time sync in
+  // main() can be hours/days stale (the bot runs continuously under
+  // KeepAlive, no scheduled restart). Clock drift on a Mac with NTP is
+  // usually <1s/day, but a stale offset can push fire-time past the
+  // server's noon window. 5 samples = ~1.5s overhead, well inside the
+  // 5-min prewarm lead.
+  let freshOffsetMs = 0;
+  try {
+    freshOffsetMs = await syncServerTime(5);
+    const sign = freshOffsetMs >= 0 ? '+' : '';
+    console.log(`[scheduler] server time resync: ${sign}${freshOffsetMs}ms`);
+  } catch (err) {
+    console.warn(`[scheduler] resync failed (${err}) — using cached offset from boot`);
+  }
+
   // Cron fires at 11:55 (5-min lead) so runWithDeepPrewarm has time to login +
   // pre-select court/slot before the noon tick. fireTime is the PLANNED noon,
   // not "now" — the engine computes prewarmFireAt = fireTime - PREWARM_LEAD_MS.
