@@ -35,7 +35,7 @@ import {
   buildCourtPriority,
   ALL_SLOTS,
 } from '../bookingFlow';
-import { getServerNow } from '../timeSync';
+import { getServerNow, syncServerTime } from '../timeSync';
 import { COURTS } from './configLoader';
 import { getOwner } from './userStore';
 
@@ -186,6 +186,17 @@ export async function runWithPrewarm(
     }
 
     // Phase 2: spin-wait for the exact tick (server-synced clock).
+    // Re-sync server time at the last possible moment so the spin-wait below
+    // uses the freshest offset. Prewarm can take 30-60s, during which the
+    // offset cached in runScheduledBooking() can drift slightly. 5 samples
+    // = ~1.5s — comfortably under the remaining budget before fire.
+    try {
+      const offsetMs = await syncServerTime(5);
+      const sign = offsetMs >= 0 ? '+' : '';
+      console.log(`[bookingEngine] resync before spin: ${sign}${offsetMs}ms`);
+    } catch (err) {
+      console.warn(`[bookingEngine] resync before spin failed (${err}) — using cached offset`);
+    }
     await spinUntil(targetTime.getTime());
     const fired_at = new Date();
     console.log(
@@ -407,6 +418,17 @@ export async function runWithDeepPrewarm(
     }
 
     // Phase 2: spin to the exact tick (server-synced clock).
+    // Re-sync server time at the last possible moment — same rationale as
+    // runWithPrewarm: prewarm can take 30-60s, offset cached in
+    // runScheduledBooking() may have drifted. 5 samples = ~1.5s, well
+    // inside the remaining budget.
+    try {
+      const offsetMs = await syncServerTime(5);
+      const sign = offsetMs >= 0 ? '+' : '';
+      console.log(`[bookingEngine] deep resync before spin: ${sign}${offsetMs}ms`);
+    } catch (err) {
+      console.warn(`[bookingEngine] deep resync before spin failed (${err}) — using cached offset`);
+    }
     await spinUntil(targetTime.getTime());
     const firedAt = new Date();
     const driftMs = firedAt.getTime() - targetTime.getTime();
