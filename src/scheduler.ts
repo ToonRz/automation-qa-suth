@@ -1,9 +1,8 @@
 // src/scheduler.ts
 // Wait until 12:00:00 (local, no tolerance per SC-04), then release all 9 accounts in parallel.
 //
-// Time source: we sync with the web server before scheduling (src/timeSync.ts). Local system
-// clock can drift tens to hundreds of ms from server clock; if we fire on local noon but
-// server is 11:59:59.700, the booking may be rejected. getServerNow() compensates for skew.
+// Time source: the local OS clock, exactly as required by SC-01/SC-04. HTTP Date
+// headers have only whole-second precision and must not shift this millisecond tick.
 //
 // CLI flags:
 //   --now           skip the wait, run immediately
@@ -13,8 +12,8 @@
 
 import { runAllAccounts } from './runner';
 import { bookOneAccount, Account } from './bookingFlow';
-import { syncServerTime, getServerNow, getOffsetMs } from './timeSync';
 import { getConfig, COURTS } from './server/configLoader';
+import { waitUntilLocalTimestamp } from './localClock';
 
 interface CliOptions {
   now: boolean;
@@ -58,19 +57,19 @@ async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function countdown(ms: number): Promise<void> {
-  const start = getServerNow();
-  const end = start + ms;
-  // Tick every second for live countdown (server-adjusted clock)
-  while (getServerNow() < end) {
-    const remaining = Math.max(0, end - getServerNow());
+async function countdown(targetMs: number): Promise<void> {
+  // Tick every second, but hand control to the precise waiter before the last
+  // 50ms. A fixed 1s final sleep could otherwise overshoot noon by almost 1s.
+  while (true) {
+    const remaining = Math.max(0, targetMs - Date.now());
+    if (remaining <= 50) break;
     const h = Math.floor(remaining / 3_600_000);
     const m = Math.floor((remaining % 3_600_000) / 60_000);
     const s = Math.floor((remaining % 60_000) / 1000);
     process.stdout.write(
       `\r⏳ รอ ${h.toString().padStart(2, '0')}:${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')} จนถึง 12:00:00 น.   `
     );
-    await sleep(1000);
+    await sleep(Math.min(1000, Math.max(1, remaining - 50)));
   }
   process.stdout.write('\n');
 }
@@ -109,33 +108,20 @@ async function main() {
     return;
   }
 
-  // Scheduled mode: sync server time FIRST, then compute target, then wait, then fire.
+  // Scheduled mode: compute local noon, wait, then fire.
   console.log(`\n=== Scheduled run ===`);
-  console.log(`Syncing with server time (5 samples)...`);
-  let offsetMs = 0;
-  try {
-    offsetMs = await syncServerTime(5);
-    const sign = offsetMs >= 0 ? '+' : '';
-    console.log(`✓ Server offset: ${sign}${offsetMs}ms (local vs server)`);
-  } catch (err) {
-    console.warn(`⚠️  Time sync failed: ${err}`);
-    console.warn(`   Falling back to local clock — clock skew risk`);
-  }
-
   const target = targetNoon(opts);
-  const diff = target.getTime() - getServerNow();
+  const diff = target.getTime() - Date.now();
 
   console.log(`Target: ${target.toLocaleString('th-TH')} (${target.toISOString()})`);
   console.log(`Mode:   ${opts.dryRun ? 'DRY-RUN' : 'LIVE'}`);
 
   if (diff > 0) {
-    await countdown(diff);
+    await countdown(target.getTime());
   }
 
-  // Spin-wait in the final 50ms for the exact tick (per SC-04, no tolerance)
-  while (getServerNow() < target.getTime()) {
-    await sleep(1);
-  }
+  // Final 1ms wait for the exact local tick (per SC-04, no tolerance).
+  await waitUntilLocalTimestamp(target.getTime());
   const fired_at = new Date();
   console.log(
     `🚀 FIRED at ${fired_at.toISOString()} (target was ${target.toISOString()}, ` +

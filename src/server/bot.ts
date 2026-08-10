@@ -49,7 +49,6 @@ import {
 } from './userStore';
 import { runWithPrewarm, runWithDeepPrewarm, EngineResult } from './bookingEngine';
 import { sendTelegramMessage } from './telegramSend';
-import { syncServerTime } from '../timeSync';
 
 dotenv.config();
 
@@ -1306,21 +1305,6 @@ async function sendPrewarmNoticesForBooking(
 }
 
 async function runScheduledBooking(): Promise<void> {
-  // Re-sync server time at the top of each noon run. The boot-time sync in
-  // main() can be hours/days stale (the bot runs continuously under
-  // KeepAlive, no scheduled restart). Clock drift on a Mac with NTP is
-  // usually <1s/day, but a stale offset can push fire-time past the
-  // server's noon window. 5 samples = ~1.5s overhead, well inside the
-  // 5-min prewarm lead.
-  let freshOffsetMs = 0;
-  try {
-    freshOffsetMs = await syncServerTime(5);
-    const sign = freshOffsetMs >= 0 ? '+' : '';
-    console.log(`[scheduler] server time resync: ${sign}${freshOffsetMs}ms`);
-  } catch (err) {
-    console.warn(`[scheduler] resync failed (${err}) — using cached offset from boot`);
-  }
-
   // Cron fires at 11:55 (5-min lead) so runWithDeepPrewarm has time to login +
   // pre-select court/slot before the noon tick. fireTime is the PLANNED noon,
   // not "now" — the engine computes prewarmFireAt = fireTime - PREWARM_LEAD_MS.
@@ -1509,20 +1493,6 @@ async function main() {
   console.log('=== Court Booking Bot ===');
   console.log(`Telegram token: ${TOKEN!.slice(0, 10)}...`);
   console.log(`Registered users: ${getAllUsers().length}`);
-
-  // Sync server time before scheduling. The bot runs as a separate process from
-  // the scheduler (npm start), so it needs its own offset. Without this, the
-  // spin-wait inside runWithPrewarm/DeepPrewarm uses getServerNow() against a
-  // target computed from local Date.now() — server-fire lands skewed by however
-  // far the local clock has drifted from the susport server.
-  try {
-    const offsetMs = await syncServerTime(5);
-    const sign = offsetMs >= 0 ? '+' : '';
-    console.log(`✓ Server time offset: ${sign}${offsetMs}ms (local vs server)`);
-  } catch (err) {
-    console.warn(`⚠️  Time sync failed: ${err}`);
-    console.warn(`   Continuing with local clock — clock skew risk`);
-  }
 
   // Eager reachability check — fail fast with a useful message if the bot
   // can't talk to Telegram from this host (e.g. IPv6-only paths blocked).

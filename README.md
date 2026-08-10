@@ -180,6 +180,8 @@ Bot start → register handlers → listen ผ่าน long polling
 
 ตั้ง `DEEP_PREWARM=1` ใน `.env` → บอทจะ login + select court/slot ไว้ตอน **11:55** (5 นาทีก่อนเที่ยง) แล้ว submit ตอนเที่ยงพร้อมกันทั้งหมด
 
+รอบเที่ยงใช้ local OS clock ที่ `12:00:00.000` โดยตรง และ fast-confirm จะไม่ query/re-select ก่อน submit
+
 ถ้า invariant check พบว่า **slot ของบาง account ถูกจองครบทุกสนาม** (priority + safety net) → ABORT:
 - console: `⛔ DEEP PREWARM ABORTED (T-5min) — N account(s) ไม่มีสนามว่าง`
 - Telegram DM ส่งหา owner (best-effort; ถ้า fail จะ log error ไม่ทิ้งรอบ)
@@ -252,7 +254,7 @@ Compose: `npm start -- --dry-run` (รอเที่ยง → dry-run)
 │   ├── runner.ts                  ← Promise.all() parallel release
 │   ├── bookingFlow.ts             ← per-account: login → court → slot → submit
 │   ├── discoverSlots.ts           ← one-off slot discovery (debug aid)
-│   ├── timeSync.ts                ← server-time sync (compensates local clock drift)
+│   ├── localClock.ts              ← local 12:00:00.000 wait (SC-01/SC-04)
 │   └── server/
 │       ├── bot.ts                 ← Telegraf bot: handlers + wizards + cron
 │       ├── bookingEngine.ts       ← runWithDeepPrewarm / runWithPrewarm / runStandard
@@ -262,7 +264,8 @@ Compose: `npm start -- --dry-run` (รอเที่ยง → dry-run)
 │       ├── sendDryRunMessages.ts  ← dry-run DM builder
 │       ├── testPrewarmNotice.ts   ← one-off test: prewarm DM message format
 │       ├── testResultsNotices.ts  ← one-off test: results DM message format
-│       └── testWizardHelpers.ts   ← one-off test: /add + /useredit wizard wiring
+│       ├── testWizardHelpers.ts   ← one-off test: /add + /useredit wizard wiring
+│       └── testFastConfirm.ts     ← regression: local tick + click-only deep prewarm
 ├── reports/                       ← auto-generated, gitignored
 ├── screenshots/                   ← auto-generated, gitignored
 ├── bot.stdout.log / bot.stderr.log ← launchd-managed logs

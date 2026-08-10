@@ -35,7 +35,7 @@ import {
   buildCourtPriority,
   ALL_SLOTS,
 } from '../bookingFlow';
-import { getServerNow, syncServerTime } from '../timeSync';
+import { waitUntilLocalTimestamp } from '../localClock';
 import { COURTS } from './configLoader';
 import { getOwner } from './userStore';
 
@@ -46,10 +46,6 @@ const SCREENSHOTS_DIR = '/app/screenshots'; // overridden via env in deploy
 // fires. 5 minutes balances PHP session GC (default 1440s) and slot-volatility
 // risk (other users may book between pre-warm and noon). Override via env.
 const PREWARM_LEAD_MS = Number(process.env.PREWARM_LEAD_SEC ?? '300') * 1000;
-// If server-clock skew is detected between pre-warm and tick, we still try the
-// fast confirm — per-account state drift is caught by bookOneAccount's sanity
-// check. Reserved for future use if telemetry shows skew matters.
-const CLOCK_SKEW_THRESHOLD_MS = 1000;
 
 interface PrewarmedContext {
   account: Account;
@@ -62,6 +58,7 @@ interface PrewarmedDeepContext {
   context: BrowserContext | null;
   page: Page | null;
   status: 'page-ready' | 'needs-standard' | 'failed';
+  courtLabel?: string;
   error?: string;
 }
 
@@ -87,12 +84,6 @@ async function prewarmContexts(
       return { account, context, page };
     })
   );
-}
-
-async function spinUntil(targetMs: number): Promise<void> {
-  while (getServerNow() < targetMs) {
-    await sleep(1);
-  }
 }
 
 /**
@@ -185,19 +176,8 @@ export async function runWithPrewarm(
       return runStandard(accounts);
     }
 
-    // Phase 2: spin-wait for the exact tick (server-synced clock).
-    // Re-sync server time at the last possible moment so the spin-wait below
-    // uses the freshest offset. Prewarm can take 30-60s, during which the
-    // offset cached in runScheduledBooking() can drift slightly. 5 samples
-    // = ~1.5s — comfortably under the remaining budget before fire.
-    try {
-      const offsetMs = await syncServerTime(5);
-      const sign = offsetMs >= 0 ? '+' : '';
-      console.log(`[bookingEngine] resync before spin: ${sign}${offsetMs}ms`);
-    } catch (err) {
-      console.warn(`[bookingEngine] resync before spin failed (${err}) — using cached offset`);
-    }
-    await spinUntil(targetTime.getTime());
+    // Phase 2: wait for the exact local tick (SC-01/SC-04).
+    await waitUntilLocalTimestamp(targetTime.getTime());
     const fired_at = new Date();
     console.log(
       `[bookingEngine] FIRE at ${fired_at.toISOString()} ` +
@@ -286,7 +266,7 @@ async function prewarmContextsDeep(
         );
         // 5. Select slot dropdown
         await page.locator('select#time').selectOption({ value: account.slot });
-        return { account, context, page, status: 'page-ready' };
+        return { account, context, page, status: 'page-ready', courtLabel: targetCourtLabel };
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err);
         // Close the partial context on failure to avoid leaking resources.
@@ -334,7 +314,7 @@ export async function runWithDeepPrewarm(
   try {
     // Sleep until the pre-warm fire window opens (T - PREWARM_LEAD_MS).
     const prewarmFireAt = targetTime.getTime() - PREWARM_LEAD_MS;
-    const now = getServerNow();
+    const now = Date.now();
     if (now < prewarmFireAt) {
       const waitMs = prewarmFireAt - now;
       console.log(`[bookingEngine] deep-prewarm sleeping ${Math.round(waitMs / 1000)}s until fire window`);
@@ -417,19 +397,8 @@ export async function runWithDeepPrewarm(
       if (c.page) await c.page.evaluate(() => 1).catch(() => null);
     }
 
-    // Phase 2: spin to the exact tick (server-synced clock).
-    // Re-sync server time at the last possible moment — same rationale as
-    // runWithPrewarm: prewarm can take 30-60s, offset cached in
-    // runScheduledBooking() may have drifted. 5 samples = ~1.5s, well
-    // inside the remaining budget.
-    try {
-      const offsetMs = await syncServerTime(5);
-      const sign = offsetMs >= 0 ? '+' : '';
-      console.log(`[bookingEngine] deep resync before spin: ${sign}${offsetMs}ms`);
-    } catch (err) {
-      console.warn(`[bookingEngine] deep resync before spin failed (${err}) — using cached offset`);
-    }
-    await spinUntil(targetTime.getTime());
+    // Phase 2: wait for the exact local tick (SC-01/SC-04).
+    await waitUntilLocalTimestamp(targetTime.getTime());
     const firedAt = new Date();
     const driftMs = firedAt.getTime() - targetTime.getTime();
 
@@ -477,14 +446,18 @@ export async function runWithDeepPrewarm(
     // - page-ready → fast confirm via prewarmedBookingPage
     // - needs-standard / failed → standard path (full login + retry loop)
     const results = await Promise.all(
-      contexts.map(({ account, page, status }) => {
+      contexts.map(({ account, page, status, courtLabel }) => {
         const baseOpts: FlowOptions = {
           browser,
           courtPriority: COURTS,
           screenshotsDir: process.env.SCREENSHOTS_DIR ?? SCREENSHOTS_DIR,
         };
         if (status === 'page-ready' && page) {
-          return bookOneAccount(account, { ...baseOpts, prewarmedBookingPage: page });
+          return bookOneAccount(account, {
+            ...baseOpts,
+            prewarmedBookingPage: page,
+            prewarmedCourtLabel: courtLabel,
+          });
         }
         return bookOneAccount(account, baseOpts);
       })

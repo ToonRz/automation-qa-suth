@@ -97,15 +97,20 @@ export interface FlowOptions {
    * select court + select slot on N pages in parallel; at 12:00:00.000 click
    * confirm on all N in the same tick.
    *
-   * When provided: skips login, uses the live #time dropdown to compute the
-   * assigned court's reserved set, attempts ONE confirm click on the assigned
-   * (court, slot). On submit-fail, falls through to the existing retry-with-
-   * fallback loop after re-querying /get_reserved_times.
+   * When provided: skips login and immediately attempts ONE confirm click on
+   * the already-selected (court, slot), with no dropdown read/re-select or
+   * availability request first. On submit-fail, it then falls through to the
+   * existing retry-with-fallback loop and re-queries /get_reserved_times.
    *
    * Note: when this is set, `bookOneAccount` does NOT own the context — the
    * caller (the engine) is responsible for closing it.
    */
   prewarmedBookingPage?: Page;
+  /**
+   * Court label selected during deep prewarm. Passing it from the engine avoids
+   * any dropdown read before the noon fast-confirm click.
+   */
+  prewarmedCourtLabel?: string;
 }
 
 const LOGIN_URL = 'https://susport.sc.su.ac.th/login.php';
@@ -315,6 +320,83 @@ export async function fetchAllReservedTimes(
  * racing parallel account, the dropdown won't include it; we want to skip
  * fast, not wait 30s for the default Playwright actionability timeout.
  */
+async function classifySubmissionResult(page: Page): Promise<AttemptOutcome> {
+  const bodyText = (await page.locator('body').textContent()) ?? '';
+
+  if (ALREADY_BOOKED_INDICATORS.some((s) => bodyText.includes(s))) {
+    return { type: 'already-booked' };
+  }
+
+  const hasSuccess = SUCCESS_INDICATORS.some((s) => bodyText.includes(s));
+  const hasExplicitFail = FAILURE_INDICATORS.some((s) => bodyText.includes(s));
+  // Susport's post-acknowledge page (booking.php → "การจองสนามวันนี้"
+  // status table) lists every booked slot as "เต็มแล้ว" but does NOT
+  // include any explicit-failure word. Treat that page as success.
+  const looksLikeStatusPage = bodyText.includes(STATUS_PAGE_HEADER);
+
+  if (hasSuccess || looksLikeStatusPage) {
+    return { type: 'success' };
+  }
+  if (hasExplicitFail) {
+    return {
+      type: 'submit-fail',
+      reason: bodyText.replace(/\s+/g, ' ').trim().slice(0, 200),
+    };
+  }
+
+  return {
+    type: 'submit-fail',
+    reason: `submit result unclear (url=${page.url()})`,
+  };
+}
+
+/**
+ * Noon fast path for a deep-prewarmed page. Court and slot were selected at
+ * T-5min, so this function arms request telemetry and clicks confirm without
+ * reading or changing any dropdown first.
+ */
+async function attemptSubmitPreselectedBooking(
+  page: Page,
+  username: string,
+  courtLabel: string,
+  slot: string
+): Promise<AttemptOutcome> {
+  const clickStartedAt = Date.now();
+  let requestSentAt: number | null = null;
+  const bookingRequest = page
+    .waitForRequest(
+      (request) =>
+        request.method() === 'POST' && !request.url().includes(RESERVED_TIMES_PATH),
+      { timeout: 3000 }
+    )
+    .then((request) => {
+      requestSentAt = Date.now();
+      return request;
+    })
+    .catch(() => null);
+
+  const submitBtn = page
+    .locator('button:has-text("จอง"), input[type="submit"][value*="จอง" i]')
+    .first();
+
+  try {
+    await submitBtn.click({ timeout: 3000 });
+  } catch {
+    return { type: 'submit-fail', reason: 'deep-prewarm submit click timeout' };
+  }
+
+  const request = await bookingRequest;
+  await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => null);
+  const requestDelay = requestSentAt === null ? 'not-observed' : `${requestSentAt - clickStartedAt}ms`;
+  console.log(
+    `[perf] ${username} fast_confirm court=${courtLabel} slot=${slot} ` +
+      `click_started=${new Date(clickStartedAt).toISOString()} request_delay=${requestDelay} ` +
+      `request_url=${request?.url() ?? 'unknown'}`
+  );
+
+  return classifySubmissionResult(page);
+}
+
 async function attemptSubmitBooking(
   page: Page,
   court: CourtInfo,
@@ -364,37 +446,7 @@ async function attemptSubmitBooking(
 
   await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => null);
   console.log(`[perf] attempt court=${court.label} slot=${slot} submit=${Date.now() - tSubmit}ms`);
-
-  const bodyText = (await page.locator('body').textContent()) ?? '';
-
-  if (ALREADY_BOOKED_INDICATORS.some((s) => bodyText.includes(s))) {
-    return { type: 'already-booked' };
-  }
-
-  const hasSuccess = SUCCESS_INDICATORS.some((s) => bodyText.includes(s));
-  const hasExplicitFail = FAILURE_INDICATORS.some((s) => bodyText.includes(s));
-  // Susport's post-acknowledge page (booking.php → "การจองสนามวันนี้"
-  // status table) lists every booked slot as "เต็มแล้ว" but does NOT
-  // include any explicit-failure word. Treat that page as success —
-  // otherwise the server had accepted the booking but the bot recorded
-  // submit-fail (false negative), and the next attempt would book a
-  // second slot for the same account.
-  const looksLikeStatusPage = bodyText.includes(STATUS_PAGE_HEADER);
-
-  if (hasSuccess || looksLikeStatusPage) {
-    return { type: 'success' };
-  }
-  if (hasExplicitFail) {
-    return {
-      type: 'submit-fail',
-      reason: bodyText.replace(/\s+/g, ' ').trim().slice(0, 200),
-    };
-  }
-
-  return {
-    type: 'submit-fail',
-    reason: `submit result unclear (url=${page.url()})`,
-  };
+  return classifySubmissionResult(page);
 }
 
 /**
@@ -503,25 +555,11 @@ export async function bookOneAccount(
   const deepPrewarmed = options.prewarmedBookingPage !== undefined;
 
   try {
-    // ---- Fresh context (BR-01/02) ----
-    if (!browser) {
-      browser = await chromium.launch({ channel: 'chrome', headless: true });
-      ownBrowser = true;
-    }
-    // For deep-prewarmed accounts we still open a context so the `finally` close
-    // call below has a non-null handle. The prewarmedBookingPage belongs to a
-    // DIFFERENT context (owned by the engine); we close only the dummy one here
-    // and let the engine's finally handle the real one. (This mirrors the
-    // prewarmedLoginPage pattern above where the dummy context is closed and
-    // the engine closes the actual prewarmed context.)
-    context = await browser.newContext({ storageState: undefined });
-    page = await context.newPage();
-
     // ---- Deep-prewarm fast path ----
-    // The engine has already submitted login and pre-selected (court, slot).
-    // Replace our dummy page with the prewarmed one, then verify state. Skip
-    // the entire login block below.
-    let prewarmedCourtLabel: string | null = null;
+    // The engine already verified and selected (court, slot) at T-5min. There
+    // must be no await, dropdown read, context creation, or availability fetch
+    // before this click: Promise.all callers therefore dispatch every account's
+    // click in the same JavaScript tick.
     if (deepPrewarmed) {
       page = options.prewarmedBookingPage!;
       if (!page.url().includes('booking.php')) {
@@ -530,48 +568,81 @@ export async function bookOneAccount(
         if (!options.dryRun) await shoot(page, screenshot);
         return result;
       }
-      // Sanity: dropdowns reflect the pre-warmed selection. If not, log a drift
-      // event and let the retry loop below re-discover via /get_reserved_times.
-      // We stay on booking.php (the URL check above confirmed) so no page-reset
-      // is needed; attemptSubmitBooking will re-select the dropdowns.
-      //
-      // IMPORTANT: account.court is the OPTION LABEL (e.g. "แบดมินตัน1"), but
-      // page.locator('#court').inputValue() returns the option's `value`
-      // attribute (e.g. "2") — comparing the two is ALWAYS a phantom drift.
-      // Confirmed via reports/slots-discovered.json: value="2" text="แบดมินตัน1".
-      // account.slot on the other hand is the option VALUE (e.g. "17:30_18:30"),
-      // matching the underscore format used in the AJAX response, so
-      // inputValue() is the right comparison there.
-      const selectedCourtLabel = await page
-        .locator('#court option:checked')
-        .textContent()
-        .then((t) => (t ?? '').trim())
-        .catch(() => null);
-      prewarmedCourtLabel = selectedCourtLabel;
-      const selectedSlotValue = await page
-        .locator('#time')
-        .inputValue()
-        .catch(() => null);
-      // "Expected" court is the first priority entry — what the engine aimed
-      // for with no alt-court override. Drift against this is the actionable
-      // signal: alt-court selections legitimately differ and aren't drift.
-      const expectedCourt = priorityCourts[0] ?? '';
-      if (selectedCourtLabel !== expectedCourt || selectedSlotValue !== account.slot) {
+      const courtLabel = options.prewarmedCourtLabel ?? priorityCourts[0];
+      if (!courtLabel) {
+        result.status = 'FAIL';
+        result.fail_reason = 'deep-prewarm: selected court label missing';
+        if (!options.dryRun) await shoot(page, screenshot);
+        return result;
+      }
+
+      if (options.dryRun) {
         result.attempts.push({
-          court: expectedCourt,
+          court: courtLabel,
+          slot: account.slot,
+          outcome: 'dry-run-would-book',
+        });
+        result.court_booked = courtLabel;
+        result.status = 'DRY-RUN';
+        result.fail_reason = `would book ${courtLabel}/${account.slot} (submit skipped)`;
+        await shoot(page, screenshot);
+        return result;
+      }
+
+      const outcome = await attemptSubmitPreselectedBooking(
+        page,
+        account.username,
+        courtLabel,
+        account.slot
+      );
+      if (outcome.type === 'success') {
+        result.attempts.push({ court: courtLabel, slot: account.slot, outcome: 'success' });
+        result.court_booked = courtLabel;
+        result.status = 'PASS';
+        result.fail_reason = null;
+        await shoot(page, screenshot);
+        return result;
+      }
+      if (outcome.type === 'already-booked') {
+        result.attempts.push({
+          court: courtLabel,
           slot: account.slot,
           outcome: 'submit-fail',
-          reason: `deep-prewarm state drift: court=${selectedCourtLabel} slot=${selectedSlotValue}`,
+          reason: 'already-booked',
         });
+        result.status = 'FAIL';
+        result.fail_reason = 'server: already booked today';
+        await shoot(page, screenshot);
+        return result;
       }
+
+      result.attempts.push({
+        court: courtLabel,
+        slot: account.slot,
+        outcome: 'submit-fail',
+        reason:
+          outcome.type === 'submit-fail'
+            ? outcome.reason
+            : 'slot-not-available after deep-prewarm submit',
+      });
+      // Only a failed fast-confirm is allowed to enter the slower discovery +
+      // fallback path. Restore booking.php if the submit response navigated away.
+      await resetToBookingPage(page);
     } else if (options.prewarmedLoginPage) {
       // Pre-warm path: caller already navigated to login.php and filled the form.
-      // We just click submit on the existing page.
+      // Click immediately; the engine owns and closes this context.
       page = options.prewarmedLoginPage;
       await page.locator('input[type="submit"]').click();
       await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => null);
     } else {
-      // Standard path: navigate, fill, submit.
+      // Standard path: create the account's isolated context, navigate, fill,
+      // and submit. Prewarmed paths already own their isolated contexts.
+      if (!browser) {
+        browser = await chromium.launch({ channel: 'chrome', headless: true });
+        ownBrowser = true;
+      }
+      context = await browser.newContext({ storageState: undefined });
+      page = await context.newPage();
       await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.locator('input[name="username"]').fill(account.username);
       await page.locator('input[name="password"]').fill(account.password);
@@ -604,39 +675,9 @@ export async function bookOneAccount(
     // read per court (saves ~500ms × courts-to-try).
     const allBadmintonCourts = await getBadmintonCourts(page);
     const courtValues = allBadmintonCourts.map((c) => c.value);
-    let reservedByValue: Map<string, string[]>;
-    if (deepPrewarmed && result.attempts.length === 0) {
-      // Deep-prewarm fast path: trust the pre-warmed state. The assigned court
-      // is currently selected and the slot dropdown is populated by the page's
-      // own onchange handler — its visible options ARE the available slots.
-      // Fetch reservations for the OTHER courts (used by the late-fallback loop)
-      // and override the assigned court's reserved set from the live dropdown.
-      const liveSlotOptions = await page
-        .locator('#time option')
-        .evaluateAll((els) =>
-          (els as HTMLOptionElement[])
-            .map((o) => o.value)
-            .filter((v) => v && v !== ''),
-        )
-        .catch(() => [] as string[]);
-      const tFetchDp = Date.now();
-      reservedByValue = await fetchAllReservedTimes(page, courtValues);
-      console.log(`[perf] ${account.username} fetch_reserved=${Date.now() - tFetchDp}ms`);
-      // The pre-warmed court is whatever the engine committed to the dropdown
-      // (could be COURTS[0] or an alt-court with the slot open). Read it back
-      // instead of guessing from account.court (now deprecated/optional).
-      const prewarmedCourt = prewarmedCourtLabel
-        ? allBadmintonCourts.find((c) => c.label === prewarmedCourtLabel)
-        : undefined;
-      if (prewarmedCourt) {
-        // Reserved = ALL_SLOTS minus what's currently visible in the dropdown.
-        reservedByValue.set(prewarmedCourt.value, ALL_SLOTS.filter((s) => !liveSlotOptions.includes(s)));
-      }
-    } else {
-      const tFetchStd = Date.now();
-      reservedByValue = await fetchAllReservedTimes(page, courtValues);
-      console.log(`[perf] ${account.username} fetch_reserved=${Date.now() - tFetchStd}ms`);
-    }
+    const tFetchStd = Date.now();
+    const reservedByValue = await fetchAllReservedTimes(page, courtValues);
+    console.log(`[perf] ${account.username} fetch_reserved=${Date.now() - tFetchStd}ms`);
 
     const availableByValue = new Map<string, string[]>();
     for (const court of allBadmintonCourts) {
@@ -655,106 +696,8 @@ export async function bookOneAccount(
     // page. We only need to navigate back to booking.php before the NEXT attempt.
     // On the first attempt we're already on booking.php — skip the reset.
     let onBookingPage = true;
-    // Deep-prewarm fast-confirm: when set, we've already attempted the assigned
-    // (court, slot) pair above, so the outer loop must skip the first iteration
-    // of `account.court` to avoid double-submitting.
-    let deepAttempted = false;
-
-    // ---- Deep-prewarm fast-confirm: try the pre-warmed (court, slot) FIRST ----
-    // The pre-warm engine has already selected these dropdowns and verified the
-    // dropdown state. attemptSubmitBooking will (re-)select and click submit
-    // without navigating, so the operation completes in ~tens of milliseconds.
-    // On submit-fail (race-loss, slot already taken) we fall through to the
-    // existing retry-with-fallback loop, which re-queries /get_reserved_times
-    // and tries fallback courts — this is the late-fallback safety net.
-    if (deepPrewarmed && result.attempts.length === 0) {
-      // Fast-confirm targets whichever court the engine committed to (could be
-      // COURTS[0] or an alt-court). Read it back from the dropdown instead of
-      // guessing from the deprecated `account.court` field.
-      const assignedCourt = prewarmedCourtLabel
-        ? allBadmintonCourts.find((c) => c.label === prewarmedCourtLabel)
-        : undefined;
-      if (assignedCourt) {
-        deepAttempted = true;
-        if (options.dryRun) {
-          result.attempts.push({
-            court: assignedCourt.label,
-            slot: account.slot,
-            outcome: 'dry-run-would-book',
-          });
-          booked = { court: assignedCourt.label, slot: account.slot };
-        } else {
-          const outcome = await attemptSubmitBooking(page, assignedCourt, account.slot);
-          if (outcome.type === 'success') {
-            result.attempts.push({
-              court: assignedCourt.label,
-              slot: account.slot,
-              outcome: 'success',
-            });
-            booked = { court: assignedCourt.label, slot: account.slot };
-          } else if (outcome.type === 'already-booked') {
-            result.attempts.push({
-              court: assignedCourt.label,
-              slot: account.slot,
-              outcome: 'submit-fail',
-              reason: 'already-booked',
-            });
-            earlyExit = 'already-booked';
-          } else {
-            result.attempts.push({
-              court: assignedCourt.label,
-              slot: account.slot,
-              outcome: 'submit-fail',
-              reason: outcome.type === 'submit-fail' ? outcome.reason : undefined,
-            });
-
-            // Grace retry: server fairness reset may not have completed yet
-            // (clock skew 50-300ms). One more submit within MAX_GRACE_MS.
-            if (Date.now() - start < MAX_GRACE_MS) {
-              if (!onBookingPage) {
-                await resetToBookingPage(page);
-                onBookingPage = true;
-              }
-              const retryOutcome = await attemptSubmitBooking(page, assignedCourt, account.slot);
-              if (retryOutcome.type === 'success') {
-                result.attempts.push({
-                  court: assignedCourt.label,
-                  slot: account.slot,
-                  outcome: 'success',
-                });
-                booked = { court: assignedCourt.label, slot: account.slot };
-              } else if (retryOutcome.type === 'already-booked') {
-                result.attempts.push({
-                  court: assignedCourt.label,
-                  slot: account.slot,
-                  outcome: 'submit-fail',
-                  reason: 'grace-retry: already-booked',
-                });
-                earlyExit = 'already-booked';
-              } else {
-                result.attempts.push({
-                  court: assignedCourt.label,
-                  slot: account.slot,
-                  outcome: 'submit-fail',
-                  reason: `grace-retry: ${retryOutcome.type === 'submit-fail' ? retryOutcome.reason : 'unknown'}`,
-                });
-                onBookingPage = false;
-              }
-            } else {
-              onBookingPage = false;
-            }
-          }
-        }
-      }
-    }
 
     outer: for (const court of courtsToTry) {
-      // Skip the priority[0] court if fast-confirm already attempted it.
-      // (With the old per-account court field this compared to account.court;
-      // now the "assigned" court is the first entry in COURT_PRIORITY.)
-      if (deepAttempted && court.label === priorityCourts[0]) continue;
-      // Skip if fast-confirm already resolved (success / already-booked).
-      if (booked || earlyExit) break;
       if (Date.now() >= deadline) break;
 
       const available = availableByValue.get(court.value) ?? [];
