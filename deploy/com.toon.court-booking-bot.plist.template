@@ -1,0 +1,53 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd supervisor for the Telegram bot. Mirrors the plist running on machine 1.
+
+  Install (see SETUP-NEW-MACHINE.md §6):
+    sed "s|__PROJECT_DIR__|$PWD|g" deploy/com.toon.court-booking-bot.plist.template \
+      > ~/Library/LaunchAgents/com.toon.court-booking-bot.plist
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/com.toon.court-booking-bot.plist
+
+  KeepAlive=true respawns the bot on crash; ThrottleInterval=10 caps the restart
+  loop at one attempt per 10s. Restart with `launchctl kickstart -k`, never pkill
+  — pkill just triggers a respawn and hides the real failure.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.toon.court-booking-bot</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/zsh</string>
+        <string>-c</string>
+        <string>cd __PROJECT_DIR__ &amp;&amp; caffeinate -disu npm run bot</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>__PROJECT_DIR__</string>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>__PROJECT_DIR__/bot.stdout.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>__PROJECT_DIR__/bot.stderr.log</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TZ</key>
+        <string>Asia/Bangkok</string>
+    </dict>
+</dict>
+</plist>

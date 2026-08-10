@@ -1,0 +1,9 @@
+{
+  "COURT_PRIORITY": ["แบดมินตัน3", "แบดมินตัน2", "แบดมินตัน1"],
+  "accounts": [
+    { "username": "REPLACE_ME", "password": "REPLACE_ME", "slot": "18:30_19:30" },
+    { "username": "REPLACE_ME", "password": "REPLACE_ME", "slot": "19:30_20:30" },
+    { "username": "REPLACE_ME", "password": "REPLACE_ME", "slot": "20:30_21:30" },
+    { "username": "REPLACE_ME", "password": "REPLACE_ME", "slot": "21:30_22:30" }
+  ]
+}
