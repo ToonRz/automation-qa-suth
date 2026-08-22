@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import type { Browser, Page, Request } from 'playwright';
+import type { Browser, Page } from 'playwright';
 import { bookOneAccount } from '../bookingFlow';
 import { waitUntilLocalTimestamp } from '../localClock';
 
@@ -37,22 +37,24 @@ async function testWaitUsesInjectedLocalClock(): Promise<void> {
 
 async function testDeepPrewarmClicksBeforeAnyOtherBrowserWork(): Promise<void> {
   const events: string[] = [];
-  let requestResolver: ((request: Request) => void) | undefined;
   let releaseClick: (() => void) | undefined;
   let newContextCalls = 0;
 
-  const bookingRequest = {
-    method: () => 'POST',
-    url: () => 'https://susport.sc.su.ac.th/booking.php',
-  } as Request;
-
   const page = {
     url: () => 'https://susport.sc.su.ac.th/booking.php',
-    waitForRequest: () => {
-      events.push('arm-booking-request');
-      return new Promise<Request>((resolve) => {
-        requestResolver = resolve;
-      });
+    // Dialog capture is registered/removed around the submit — silent no-ops.
+    on: () => page,
+    off: () => page,
+    // The booking POST response — the universal "server answered" signal the
+    // submit now waits on instead of blocking the click on navigation.
+    waitForResponse: async () => {
+      events.push('arm-booking-response');
+      return { request: () => ({ method: () => 'POST' }), url: () => 'book_court.php' };
+    },
+    // No redirect to reservations.php in this mock — resolves to the caller's
+    // `.catch(() => null)`; classification then falls back to the page body.
+    waitForURL: async () => {
+      throw new Error('no reservations redirect (mock)');
     },
     waitForLoadState: async () => {
       events.push('wait-load-state');
@@ -62,11 +64,11 @@ async function testDeepPrewarmClicksBeforeAnyOtherBrowserWork(): Promise<void> {
         events.push('locate-submit');
         return {
           first: () => ({
-            click: () => new Promise<void>((resolve) => {
-              events.push('click-submit');
-              requestResolver?.(bookingRequest);
-              releaseClick = resolve;
-            }),
+            click: () =>
+              new Promise<void>((resolve) => {
+                events.push('click-submit');
+                releaseClick = resolve;
+              }),
           }),
         };
       }
@@ -107,9 +109,11 @@ async function testDeepPrewarmClicksBeforeAnyOtherBrowserWork(): Promise<void> {
 
   // The click must be dispatched synchronously when bookOneAccount is called.
   // This is what lets Promise.all map all 9 accounts before awaiting any one.
+  // (The submit now arms the POST-response observer just before clicking, but
+  // that arming is still synchronous — no navigation/context work precedes it.)
   assert.deepEqual(events.slice(0, 3), [
-    'arm-booking-request',
     'locate-submit',
+    'arm-booking-response',
     'click-submit',
   ]);
   assert.equal(newContextCalls, 0);

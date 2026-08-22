@@ -1579,7 +1579,21 @@ async function startPollingLoop(): Promise<void> {
       const msToNoon = noonMs - nowMs;
       const pollTimeout = msToNoon > 0 && msToNoon <= 6 * 60_000 ? 5 : 25;
       const url = `${apiBase}/getUpdates?timeout=${pollTimeout}&offset=${offset}`;
-      const res = await fetch(url, { method: 'GET' });
+      // Hard client-side ceiling on the request: the server holds the long-poll
+      // for `pollTimeout` seconds, so anything past that + a network margin is a
+      // stuck connection. Without this, a half-open socket (seen as
+      // UND_ERR_CONNECT_TIMEOUT / silent hangs on this network) can wedge the
+      // loop and stop the bot from ever seeing new updates. AbortController
+      // guarantees the fetch is torn down and the loop re-issues getUpdates.
+      const pollController = new AbortController();
+      const pollAbort = setTimeout(() => pollController.abort(), (pollTimeout + 15) * 1000);
+      pollAbort.unref?.();
+      let res: Response;
+      try {
+        res = await fetch(url, { method: 'GET', signal: pollController.signal });
+      } finally {
+        clearTimeout(pollAbort);
+      }
       if (!res.ok) {
         throw new Error(`getUpdates HTTP ${res.status}`);
       }

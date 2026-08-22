@@ -25,7 +25,7 @@
 // src/server/configLoader.ts). Per-court slot fallback is intentionally disabled —
 // every account tries ONLY its own slot across the priority list.
 
-import { Browser, BrowserContext, Page, chromium } from 'playwright';
+import { Browser, BrowserContext, Dialog, Locator, Page, chromium } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -119,6 +119,21 @@ const RESERVED_TIMES_PATH = 'get_reserved_times';
 const DEFAULT_SCREENSHOTS_DIR = path.resolve(__dirname, '..', 'screenshots');
 const DEFAULT_RETRY_DEADLINE_MS = 30_000;
 
+// Submit-outcome timing. The submit click no longer BLOCKS on the POST
+// navigation (see attemptSubmit* — we click with noWaitAfter and observe the
+// POST response separately). These bound how long we wait for the server to
+// answer the booking POST before classifying, and how long we give a possible
+// success-redirect to reach reservations.php once the POST has responded.
+//
+// Why this matters: Playwright's default click waits for the triggered
+// navigation to commit. At noon susport frequently answers the booking POST in
+// 1.5-2.5s (occasionally slower), so a 3s click timeout used to THROW while the
+// POST was still in flight — the account was misreported ERROR/submit-fail even
+// though it had booked. Waiting for the POST response with a generous timeout
+// fixes that.
+const SUBMIT_RESULT_TIMEOUT_MS = 15_000;
+const SUBMIT_REDIRECT_SETTLE_MS = 1_500;
+
 /**
  * Grace retry window for soft-hold slot recovery at T+0.
  *
@@ -149,25 +164,42 @@ export const ALL_SLOTS = [
 // update here. We use TIGHT success indicators only — the word "ยืนยัน"
 // appears in the rules text on every booking.php page and would cause false
 // positive PASS if used as success.
+// "You have already booked a court today" (server's 1-booking-per-day limit) —
+// TERMINAL: the account must NOT try other courts.
+//
+// Must stay SPECIFIC. The bare substring 'จองแล้ว' was removed because it also
+// matches race-loss copy like "เวลานี้มีผู้จองแล้ว" (someone ELSE booked this
+// slot) — which is the opposite case and must fall back to the next court, not
+// stop. This matters now that dialog text is fed into the classifier (see
+// classifySubmissionResult); before, race-loss alerts were never read.
 const ALREADY_BOOKED_INDICATORS = [
   'ได้จองสนามวันนี้แล้ว',
-  'จองแล้ว',
-  'already booked',
+  'จองสนามวันนี้แล้ว',
+  'already booked today',
 ];
-// Success: must be on a confirmation page (post-submit redirect). These phrases
-// don't appear on the booking form page itself.
-const SUCCESS_INDICATORS = ['จองเรียบร้อย', 'จองสำเร็จ', 'booking success', 'success'];
+// Success (secondary signal): explicit "booked" confirmation copy, from either
+// a dialog message or the page body. The PRIMARY success signal is landing on
+// reservations.php with our own username in a booking row — see
+// classifySubmissionResult. Kept TIGHT: the bare word "success" was removed
+// because it can appear in unrelated markup/analytics and risks a false PASS.
+const SUCCESS_INDICATORS = ['จองเรียบร้อย', 'จองสำเร็จ', 'จองสนามสำเร็จ', 'booking success'];
 // Failure words that NEVER appear on the post-acknowledge status page —
 // 'เต็ม' (without แล้ว) used to be here but was a false-positive trap:
 // the status page lists every booked slot as "เต็มแล้ว" and a substring
-// match on 'เต็ม' flipped real-success into submit-fail. Use the header
-// check below instead for the status-page case.
+// match on 'เต็ม' flipped real-success into submit-fail.
 const FAILURE_INDICATORS = ['ล้มเหลว', 'ผิดพลาด', 'ไม่สำเร็จ', 'error', 'ซ้ำ', 'ไม่ว่าง'];
-// Post-submit "การจองสนามวันนี้" view — every booked slot renders "เต็มแล้ว"
-// but no explicit-failure word. We use the page header ("การจองสนาม") as
-// a distinctive marker rather than row count, since real failures can
-// also contain "เต็ม" in a short message.
-const STATUS_PAGE_HEADER = 'การจองสนาม';
+// The post-submit reservations view is titled "การจองสนามในวันที่ <date>".
+// This exact phrase does NOT appear on the booking FORM page (whose only
+// similar copy is the rules line "ระเบียบการจองสนามกีฬา"), so it is a safe
+// marker for "we are on the reservations page".
+//
+// The old marker was the bare substring 'การจองสนาม', which ALSO matched the
+// rules line "ระเบียบ*การจองสนาม*กีฬา" on the empty booking form — so any bounce
+// back to the form was misclassified as a PASS (5 empty-form screenshots were
+// reported PASS on 2026-08-22). Tightened to the full title here, and success
+// now additionally requires our own username to be present in the page.
+const RESERVATION_PAGE_HEADER = 'การจองสนามในวันที่';
+const RESERVATIONS_URL_MARKER = 'reservations.php';
 
 type AttemptOutcome =
   | { type: 'success' }
@@ -215,14 +247,21 @@ async function waitForSlotDropdown(page: Page, timeout = 10000): Promise<void> {
   });
 }
 
-/** Returns all court dropdown entries with their backing values, filtered to badminton only. */
+/** Returns all court dropdown entries with their backing values, filtered to badminton only.
+ *
+ * Timeout: 8s (not Playwright's 30s default). If #court is absent the page is not
+ * the booking form — e.g. we were redirected to reservations.php after an
+ * already-booked login, or a submit navigated away. Waiting the full 30s there
+ * only delays the inevitable FAIL and eats into the 30s retry budget (this is
+ * exactly what turned two already-booked accounts into 33s ERRORs on 2026-08-22).
+ */
 export async function getBadmintonCourts(page: Page): Promise<CourtInfo[]> {
   return await page.locator('#court').evaluate((el) => {
     const sel = el as HTMLSelectElement;
     return Array.from(sel.options)
       .map((o) => ({ label: (o.textContent ?? '').trim(), value: o.value }))
       .filter((o) => o.label.includes('แบดมินตัน') && !o.label.includes('เทนนิส'));
-  });
+  }, { timeout: 8_000 });
 }
 
 /**
@@ -312,42 +351,135 @@ export async function fetchAllReservedTimes(
 }
 
 /**
- * Attempt to submit a booking for the given (court, slot). The page's #court
- * dropdown is selected first (triggers AJAX that populates #time), then #time
- * is selected, then the submit button is clicked.
+ * Classify the page state after a booking submit into success / already-booked /
+ * submit-fail.
  *
- * SHORT TIMEOUTS (3s) on selectOption and click — if the slot was taken by a
- * racing parallel account, the dropdown won't include it; we want to skip
- * fast, not wait 30s for the default Playwright actionability timeout.
+ * `username` is REQUIRED: a real PASS is only granted when the server has taken
+ * us to the reservations page AND our own account's row is present. This is the
+ * fix for the false-PASS bug — the old logic granted success on the bare
+ * substring "การจองสนาม", which is also inside the rules line
+ * "ระเบียบการจองสนามกีฬา" on the empty booking FORM, so every bounce back to the
+ * form was reported PASS.
+ *
+ * `dialogMessages` are any window.alert/confirm texts captured during the submit
+ * (Playwright would otherwise auto-dismiss and discard them). They carry the
+ * server's own reason on race-loss ("มีผู้จองแล้ว" etc.) — used for detection
+ * and for a human-readable fail_reason.
  */
-async function classifySubmissionResult(page: Page): Promise<AttemptOutcome> {
-  const bodyText = (await page.locator('body').textContent()) ?? '';
+async function classifySubmissionResult(
+  page: Page,
+  username: string,
+  dialogMessages: string[] = []
+): Promise<AttemptOutcome> {
+  const url = page.url();
+  const bodyText = (await page.locator('body').textContent().catch(() => '')) ?? '';
+  // Search both the rendered page and any captured dialog text.
+  const haystacks = [bodyText, ...dialogMessages];
+  const matches = (indicators: string[]): boolean =>
+    haystacks.some((h) => indicators.some((s) => h.includes(s)));
 
-  if (ALREADY_BOOKED_INDICATORS.some((s) => bodyText.includes(s))) {
+  // 1. Already booked today — terminal (do NOT try other courts).
+  if (matches(ALREADY_BOOKED_INDICATORS)) {
     return { type: 'already-booked' };
   }
 
-  const hasSuccess = SUCCESS_INDICATORS.some((s) => bodyText.includes(s));
-  const hasExplicitFail = FAILURE_INDICATORS.some((s) => bodyText.includes(s));
-  // Susport's post-acknowledge page (booking.php → "การจองสนามวันนี้"
-  // status table) lists every booked slot as "เต็มแล้ว" but does NOT
-  // include any explicit-failure word. Treat that page as success.
-  const looksLikeStatusPage = bodyText.includes(STATUS_PAGE_HEADER);
-
-  if (hasSuccess || looksLikeStatusPage) {
+  // 2. PRIMARY success: we are on the reservations page AND our own username
+  //    appears in a booking row. Both conditions are required — a redirect
+  //    without our row, or our username on some other page, is not proof.
+  const onReservationsPage =
+    url.includes(RESERVATIONS_URL_MARKER) || bodyText.includes(RESERVATION_PAGE_HEADER);
+  const myRowPresent = bodyText.includes(username);
+  if (onReservationsPage && myRowPresent) {
     return { type: 'success' };
   }
-  if (hasExplicitFail) {
-    return {
-      type: 'submit-fail',
-      reason: bodyText.replace(/\s+/g, ' ').trim().slice(0, 200),
-    };
+
+  // 3. Explicit failure (race-loss / server error) — caller retries next court.
+  if (matches(FAILURE_INDICATORS)) {
+    const reason = (dialogMessages[0] ?? bodyText).replace(/\s+/g, ' ').trim().slice(0, 200);
+    return { type: 'submit-fail', reason: reason || 'server reported failure' };
   }
 
-  return {
-    type: 'submit-fail',
-    reason: `submit result unclear (url=${page.url()})`,
+  // 4. SECONDARY success: server explicitly said "booked" (dialog or body) even
+  //    though we could not confirm the reservations row (e.g. no redirect).
+  if (matches(SUCCESS_INDICATORS)) {
+    return { type: 'success' };
+  }
+
+  // 5. Anything else — including a bounce back to the empty booking form — is
+  //    NOT a booking. This is the case the old code wrongly called PASS.
+  const reason = dialogMessages.length
+    ? `dialog: ${dialogMessages.join(' | ').slice(0, 180)}`
+    : `no booking confirmed (url=${url})`;
+  return { type: 'submit-fail', reason };
+}
+
+/**
+ * Click a submit control and wait for the server to answer the booking POST,
+ * WITHOUT letting the click block on that navigation.
+ *
+ * Playwright's default click waits for the POST-triggered navigation to commit,
+ * so a 3s click timeout THROWS while the POST is still in flight — at noon
+ * susport often answers in 1.5-2.5s (sometimes slower), which is why 12/17
+ * accounts were misreported on 2026-08-22 even though their POST had been sent.
+ * We click with noWaitAfter (returns once the button is pressed) and observe the
+ * POST response + any success redirect explicitly, with generous timeouts.
+ *
+ * Returns captured dialog text and POST telemetry. Throws only if the click
+ * itself cannot be performed (button missing/covered) — the caller treats that
+ * as submit-fail.
+ */
+async function clickSubmitAndAwaitOutcome(
+  page: Page,
+  submitBtn: Locator
+): Promise<{ dialogMessages: string[]; postObserved: boolean; postDelayMs: number | null }> {
+  const dialogMessages: string[] = [];
+  const onDialog = (dialog: Dialog): void => {
+    dialogMessages.push(dialog.message());
+    // Match Playwright's default (auto-dismiss); we only add capture on top.
+    dialog.dismiss().catch(() => {});
   };
+  page.on('dialog', onDialog);
+
+  const clickStartedAt = Date.now();
+  let postObserved = false;
+  let postDelayMs: number | null = null;
+
+  // Arm the POST-response observer BEFORE the click so it is registered before
+  // the request fires. Fires on both success and failure — it is the universal
+  // "server has processed the submit" signal.
+  const postResponse = page
+    .waitForResponse(
+      (r) => r.request().method() === 'POST' && !r.url().includes(RESERVED_TIMES_PATH),
+      { timeout: SUBMIT_RESULT_TIMEOUT_MS }
+    )
+    .then(() => {
+      postObserved = true;
+      postDelayMs = Date.now() - clickStartedAt;
+    })
+    .catch(() => {
+      /* no POST observed within the window — classifier will read the page */
+    });
+
+  try {
+    await submitBtn.click({ timeout: 3000, noWaitAfter: true });
+  } catch (err) {
+    page.off('dialog', onDialog);
+    throw err;
+  }
+
+  // Wait for the server to answer, then give a possible success redirect a short
+  // window to land on reservations.php before we classify. On failure (no
+  // redirect) this only costs SUBMIT_REDIRECT_SETTLE_MS.
+  await postResponse;
+  await page
+    .waitForURL((u) => u.href.includes(RESERVATIONS_URL_MARKER), {
+      timeout: SUBMIT_REDIRECT_SETTLE_MS,
+    })
+    .catch(() => null);
+  await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => null);
+
+  page.off('dialog', onDialog);
+  return { dialogMessages, postObserved, postDelayMs };
 }
 
 /**
@@ -362,45 +494,32 @@ async function attemptSubmitPreselectedBooking(
   slot: string
 ): Promise<AttemptOutcome> {
   const clickStartedAt = Date.now();
-  let requestSentAt: number | null = null;
-  const bookingRequest = page
-    .waitForRequest(
-      (request) =>
-        request.method() === 'POST' && !request.url().includes(RESERVED_TIMES_PATH),
-      { timeout: 3000 }
-    )
-    .then((request) => {
-      requestSentAt = Date.now();
-      return request;
-    })
-    .catch(() => null);
-
   const submitBtn = page
     .locator('button:has-text("จอง"), input[type="submit"][value*="จอง" i]')
     .first();
 
+  let outcome;
   try {
-    await submitBtn.click({ timeout: 3000 });
+    outcome = await clickSubmitAndAwaitOutcome(page, submitBtn);
   } catch {
-    return { type: 'submit-fail', reason: 'deep-prewarm submit click timeout' };
+    return { type: 'submit-fail', reason: 'deep-prewarm submit click failed' };
   }
 
-  const request = await bookingRequest;
-  await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => null);
-  const requestDelay = requestSentAt === null ? 'not-observed' : `${requestSentAt - clickStartedAt}ms`;
+  const requestDelay = outcome.postDelayMs === null ? 'not-observed' : `${outcome.postDelayMs}ms`;
   console.log(
     `[perf] ${username} fast_confirm court=${courtLabel} slot=${slot} ` +
       `click_started=${new Date(clickStartedAt).toISOString()} request_delay=${requestDelay} ` +
-      `request_url=${request?.url() ?? 'unknown'}`
+      `post_observed=${outcome.postObserved} url=${page.url()}`
   );
 
-  return classifySubmissionResult(page);
+  return classifySubmissionResult(page, username, outcome.dialogMessages);
 }
 
 async function attemptSubmitBooking(
   page: Page,
   court: CourtInfo,
-  slot: string
+  slot: string,
+  username: string
 ): Promise<AttemptOutcome> {
   const tStart = Date.now();
   try {
@@ -438,15 +557,17 @@ async function attemptSubmitBooking(
     .first();
 
   const tSubmit = Date.now();
+  let outcome;
   try {
-    await submitBtn.click({ timeout: 3000 });
+    outcome = await clickSubmitAndAwaitOutcome(page, submitBtn);
   } catch {
-    return { type: 'submit-fail', reason: 'submit click timeout' };
+    return { type: 'submit-fail', reason: 'submit click failed' };
   }
-
-  await page.waitForLoadState('domcontentloaded', { timeout: 8000 }).catch(() => null);
-  console.log(`[perf] attempt court=${court.label} slot=${slot} submit=${Date.now() - tSubmit}ms`);
-  return classifySubmissionResult(page);
+  console.log(
+    `[perf] attempt court=${court.label} slot=${slot} submit=${Date.now() - tSubmit}ms ` +
+      `post_observed=${outcome.postObserved} url=${page.url()}`
+  );
+  return classifySubmissionResult(page, username, outcome.dialogMessages);
 }
 
 /**
@@ -716,7 +837,7 @@ export async function bookOneAccount(
           await resetToBookingPage(page);
           onBookingPage = true;
         }
-        const graceOutcome = await attemptSubmitBooking(page, court, account.slot);
+        const graceOutcome = await attemptSubmitBooking(page, court, account.slot, account.username);
         if (graceOutcome.type === 'success') {
           result.attempts.push({
             court: court.label,
@@ -771,7 +892,7 @@ export async function bookOneAccount(
         await resetToBookingPage(page);
         onBookingPage = true;
       }
-      const outcome = await attemptSubmitBooking(page, court, slot);
+      const outcome = await attemptSubmitBooking(page, court, slot, account.username);
       if (outcome.type === 'success') {
         result.attempts.push({ court: court.label, slot, outcome: 'success' });
         booked = { court: court.label, slot };
