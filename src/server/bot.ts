@@ -47,7 +47,9 @@ import {
   AccountResult,
   User,
 } from './userStore';
-import { runWithPrewarm, runWithDeepPrewarm, EngineResult } from './bookingEngine';
+import { runPrewarmedBatch, runStandard } from './bookingEngine';
+import type { BookingResult } from '../bookingFlow';
+import { waitUntilLocalTimestamp } from '../localClock';
 import { sendTelegramMessage } from './telegramSend';
 
 dotenv.config();
@@ -1167,8 +1169,8 @@ bot.on('text', async (ctx) => {
 // ---- Scheduler wiring ----
 
 /** Map bookingEngine results to the lighter AccountResult shape for storage/Telegram. */
-function toAccountResults(engine: EngineResult): AccountResult[] {
-  return engine.results.map((r) => ({
+function toAccountResults(results: BookingResult[]): AccountResult[] {
+  return results.map((r) => ({
     username: r.username,
     court: r.court_attempted,
     slot: r.slot,
@@ -1177,13 +1179,6 @@ function toAccountResults(engine: EngineResult): AccountResult[] {
     court_booked: r.court_booked,
     duration_ms: r.duration_ms,
   }));
-}
-
-interface ScheduledRun {
-  user: { chat_id: number; display_name: string };
-  accounts: AccountResult[];
-  totalMs: number;
-  mode: 'prewarm' | 'standard';
 }
 
 /** Send a prewarm DM with 1 retry (maxAttempts=2) on transient network
@@ -1305,11 +1300,9 @@ async function sendPrewarmNoticesForBooking(
 }
 
 async function runScheduledBooking(): Promise<void> {
-  // Cron fires at 11:55 (5-min lead) so runWithDeepPrewarm has time to login +
-  // pre-select court/slot before the noon tick. fireTime is the PLANNED noon,
-  // not "now" — the engine computes prewarmFireAt = fireTime - PREWARM_LEAD_MS.
-  // (Was `fireTime = new Date()`, which made prewarmFireAt land in the past at
-  // cron callback, defeating the 5-min prewarm window.)
+  // Cron fires at 11:55 (5-min lead) so runPrewarmedBatch has time to login +
+  // pre-select before the noon tick. fireTime is the PLANNED noon, not "now" —
+  // the engine computes prewarmFireAt = fireTime - prewarmLeadMs().
   const fireTime = nextNoon();
   console.log(
     `\n[scheduler] cron fired at ${new Date().toISOString()}, ` +
@@ -1354,12 +1347,11 @@ async function runScheduledBooking(): Promise<void> {
   }
   void sendPrewarmNoticesForBooking(prewarmRecipients, fireTime, new Date());
 
-  const useDeep = process.env.DEEP_PREWARM === '1';
-  const tasks: { user: typeof owner; run: () => Promise<EngineResult> }[] = [];
-
+  // Collect the users to book this round (skip-with-DM for anyone who turned
+  // cron off between filter and fire — same semantics as before).
+  const bookUsers: User[] = [];
   if (owner && owner.accounts.length > 0) {
     if (!isCronEnabled(owner.chat_id)) {
-      // Owner disabled cron — skip and notify.
       console.log(`[scheduler] skipping owner ${owner.display_name} (cron disabled)`);
       try {
         await sendTelegramMessage(
@@ -1371,28 +1363,9 @@ async function runScheduledBooking(): Promise<void> {
         console.warn(`[scheduler] failed to send skip notice to owner: ${err}`);
       }
     } else {
-      tasks.push({
-        user: owner,
-        run: () =>
-          useDeep
-            ? runWithDeepPrewarm(owner!.accounts, fireTime)
-            : runWithPrewarm(owner!.accounts, fireTime),
-      });
+      bookUsers.push(owner);
     }
   }
-
-  // Helper: push a friend task using the same DEEP_PREWARM selection as owner.
-  const pushFriendTask = (friend: NonNullable<typeof owner>): void => {
-    tasks.push({
-      user: friend,
-      run: () =>
-        useDeep
-          ? runWithDeepPrewarm(friend.accounts, fireTime)
-          : runWithPrewarm(friend.accounts, fireTime),
-    });
-  };
-
-  // Auto friends — race check: cron could flip off between filter and loop.
   for (const friend of autoFriends) {
     if (!isCronEnabled(friend.chat_id)) {
       console.log(`[scheduler] skipping friend ${friend.display_name} (cron disabled since filter)`);
@@ -1407,78 +1380,121 @@ async function runScheduledBooking(): Promise<void> {
       }
       continue;
     }
-    pushFriendTask(friend);
+    bookUsers.push(friend);
   }
-
-  // Opt-in friends — they /book'd while cron was off. If cron has since flipped on,
-  // still book them this round (their pending was valid at /book time). setLastResult
-  // after the run clears pending_booking, so future rounds rely on cron state alone.
+  // Opt-in friends — they /book'd while cron was off. setLastResult after the
+  // run clears pending_booking, so future rounds rely on cron state alone.
   for (const friend of optInFriends) {
-    pushFriendTask(friend);
+    bookUsers.push(friend);
   }
 
-  if (tasks.length === 0) {
+  if (bookUsers.length === 0) {
     console.log('[scheduler] no users to book — nothing to do');
     return;
   }
 
-  // Run all user-groups IN PARALLEL. Each group launches its own Chrome browser
-  // and spins to the same fireTime, so owner and cron=on friends fire at
-  // the same noon tick — fair race for shared (court, slot) pairs.
-  //
-  // Why parallel (replaces earlier sequential loop): sequential execution
-  // made every friend task start AFTER owner dispatch completed (~68s past
-  // fire), guaranteeing friend lost every slot-race to the owner. Parallel
-  // costs ~+1 browser in memory for ~6 min — acceptable since the susport
-  // login/confirm endpoints don't rate-limit on user/pass auth (no bot
-  // signature). Each task has its own try/catch, so a single failure (login
-  // error, setLastResult disk full, DM API blip) is isolated. Promise.allSettled
-  // — not Promise.all — so an unhandled throw outside the inner try/catch
-  // doesn't reject the whole batch.
-  const runs: ScheduledRun[] = [];
-  await Promise.allSettled(
-    tasks.map(async (task) => {
-      if (!task.user) return;
+  // ---- ONE batch across every user ----
+  // Single browser, one isolated context per account, ONE Promise.all dispatch
+  // at the tick — every account races fairly (the old per-user engines gave
+  // the second user's group a 45-280ms structural handicap because its timer
+  // ran after the first group's dispatch). Promise.all preserves input order,
+  // so results map back to users by index slices — no reliance on username
+  // uniqueness across users.
+  interface Group {
+    user: User;
+    start: number;
+    count: number;
+    settled: number;
+    results: BookingResult[];
+  }
+  const groups: Group[] = [];
+  const flat: User['accounts'] = [];
+  const indexToGroup: Group[] = [];
+  for (const u of bookUsers) {
+    const g: Group = {
+      user: u,
+      start: flat.length,
+      count: u.accounts.length,
+      settled: 0,
+      results: new Array<BookingResult>(u.accounts.length),
+    };
+    groups.push(g);
+    for (const acc of u.accounts) {
+      flat.push(acc);
+      indexToGroup.push(g);
+    }
+  }
+
+  // DEEP_PREWARM semantics: '0' is the kill-switch (skip prewarm entirely,
+  // full logins at noon). Anything else — including unset — runs the prewarmed
+  // batch. (The old shallow-prewarm middle mode was removed; login-ready
+  // inside the engine strictly dominates it.)
+  const usePrewarm = process.env.DEEP_PREWARM !== '0';
+  const modeLabel: 'prewarm' | 'standard' = usePrewarm ? 'prewarm' : 'standard';
+  const dmPromises: Promise<void>[] = [];
+
+  // DM each user the moment THEIR accounts are all settled — one slow account
+  // in another group no longer delays this user's report.
+  const dmGroup = (g: Group): void => {
+    const accts = toAccountResults(g.results);
+    setLastResult(g.user.chat_id, { triggered_at: fireTime.toISOString(), accounts: accts });
+    const totalMs = Math.max(0, Date.now() - fireTime.getTime());
+    dmPromises.push(
+      sendTelegramMessage(
+        g.user.chat_id,
+        formatResultsForUser(g.user.display_name, accts, modeLabel, totalMs)
+      ).catch((err) =>
+        console.warn(`[scheduler] failed to DM ${g.user.display_name}: ${err}`)
+      )
+    );
+  };
+
+  const onAccountSettled = (index: number, result: BookingResult): void => {
+    const g = indexToGroup[index];
+    if (!g) return;
+    g.results[index - g.start] = result;
+    g.settled += 1;
+    if (g.settled === g.count) {
       try {
-        const engine = await task.run();
-        const accts = toAccountResults(engine);
-        setLastResult(task.user.chat_id, { triggered_at: fireTime.toISOString(), accounts: accts });
-        runs.push({
-          user: { chat_id: task.user.chat_id, display_name: task.user.display_name },
-          accounts: accts,
-          totalMs: engine.total_ms,
-          mode: engine.mode,
-        });
-        // DM the user their results
-        try {
-          await sendTelegramMessage(
-            task.user.chat_id,
-            formatResultsForUser(task.user.display_name, accts, engine.mode, engine.total_ms)
-          );
-        } catch (err) {
-          console.warn(`[scheduler] failed to DM ${task.user.display_name}: ${err}`);
-        }
+        dmGroup(g);
       } catch (err) {
-        console.error(`[scheduler] booking failed for ${task.user.display_name}: ${err}`);
+        console.warn(`[scheduler] result handling failed for ${g.user.display_name}: ${err}`);
+      }
+    }
+  };
+
+  try {
+    if (usePrewarm) {
+      await runPrewarmedBatch(flat, fireTime, { onAccountSettled });
+    } else {
+      console.log('[scheduler] DEEP_PREWARM=0 — standard mode (no prewarm), waiting for tick');
+      await waitUntilLocalTimestamp(fireTime.getTime());
+      await runStandard(flat, { onAccountSettled });
+    }
+  } catch (err) {
+    console.error(`[scheduler] booking batch failed: ${err}`);
+    for (const g of groups) {
+      if (g.settled < g.count) {
         try {
-          await sendTelegramMessage(
-            task.user.chat_id,
-            `❌ เกิดข้อผิดพลาดระหว่างจอง: ${err}`
-          );
+          await sendTelegramMessage(g.user.chat_id, `❌ เกิดข้อผิดพลาดระหว่างจอง: ${err}`);
         } catch {
           /* ignore */
         }
       }
-    })
-  );
+    }
+    return;
+  }
 
-  // DM owner with cross-user summary (in addition to their own results above).
+  // Let in-flight per-group DMs land before the summary.
+  await Promise.allSettled(dmPromises);
+
+  // DM owner with the cross-user summary (in addition to their own results).
   if (owner) {
     try {
       await sendTelegramMessage(
         owner.chat_id,
         formatSummaryForOwner(
-          runs.map((r) => ({ user: r.user.display_name, accounts: r.accounts }))
+          groups.map((g) => ({ user: g.user.display_name, accounts: toAccountResults(g.results) }))
         )
       );
     } catch (err) {

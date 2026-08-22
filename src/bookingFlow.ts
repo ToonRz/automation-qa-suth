@@ -28,6 +28,7 @@
 import { Browser, BrowserContext, Dialog, Locator, Page, chromium } from 'playwright';
 import * as fs from 'fs';
 import * as path from 'path';
+import { getCourtId, updateCourtIds } from './courtIdCache';
 
 export interface Account {
   username: string;
@@ -79,28 +80,14 @@ export interface FlowOptions {
    */
   courtPriority?: string[];
   /**
-   * A page that has ALREADY been navigated to login.php and had username/password
-   * filled in but NOT submitted. Used by the pre-warm optimization: open N contexts
-   * + fill forms during the countdown, then click submit on all N in the same tick
-   * to shave ~500-1000ms off the noon race.
-   *
-   * When provided: the function reuses the existing page/context and only clicks
-   * submit. When omitted: standard navigate + fill + submit.
-   */
-  prewarmedLoginPage?: Page;
-  /**
    * A page that has ALREADY been logged in, navigated to booking.php, and had
-   * #court + #time pre-selected for (account.court, account.slot). The confirm
-   * button is NOT clicked yet — the noon-tick phase clicks it.
+   * #court + #time pre-selected for the account's slot at T-5min ("page-ready").
+   * The submit has NOT been fired yet — the noon-tick phase fires it.
    *
-   * Used by `runWithDeepPrewarm` (DEEP_PREWARM=1): at T-5min, submit login +
-   * select court + select slot on N pages in parallel; at 12:00:00.000 click
-   * confirm on all N in the same tick.
-   *
-   * When provided: skips login and immediately attempts ONE confirm click on
-   * the already-selected (court, slot), with no dropdown read/re-select or
-   * availability request first. On submit-fail, it then falls through to the
-   * existing retry-with-fallback loop and re-queries /get_reserved_times.
+   * When provided: skips login and immediately fires ONE submit for the
+   * pre-selected (court, slot), with no dropdown read/re-select or availability
+   * request first. On submit-fail, it then falls through to the retry-with-
+   * fallback loop and re-queries /get_reserved_times.
    *
    * Note: when this is set, `bookOneAccount` does NOT own the context — the
    * caller (the engine) is responsible for closing it.
@@ -108,9 +95,29 @@ export interface FlowOptions {
   prewarmedBookingPage?: Page;
   /**
    * Court label selected during deep prewarm. Passing it from the engine avoids
-   * any dropdown read before the noon fast-confirm click.
+   * any dropdown read before the noon fast submit.
    */
   prewarmedCourtLabel?: string;
+  /**
+   * Dropdown value id of the pre-selected court (page-ready). Used by the
+   * fetch submit path for logging/telemetry; the submit itself reuses the
+   * values already selected in the DOM, so this is informational.
+   */
+  prewarmedCourtValue?: string;
+  /**
+   * A page that logged in successfully at T-5min but could NOT be pre-selected
+   * ("login-ready") — typically because the 11:55 dropdown still reflects
+   * yesterday's bookings and omits the target court entirely (the server only
+   * resets at 12:00). The page is parked on booking.php with a STALE dropdown.
+   *
+   * Noon flow (fetch mode): inject the target court's <option> from the
+   * persistent court-id cache and POST immediately — no reload. If no priority
+   * court has a cached id (or in click mode), reload booking.php to get the
+   * fresh post-reset dropdown, then run the normal discovery + retry loop.
+   *
+   * Note: engine owns the context (same as prewarmedBookingPage).
+   */
+  loginReadyPage?: Page;
 }
 
 const LOGIN_URL = 'https://susport.sc.su.ac.th/login.php';
@@ -133,6 +140,24 @@ const DEFAULT_RETRY_DEADLINE_MS = 30_000;
 // fixes that.
 const SUBMIT_RESULT_TIMEOUT_MS = 15_000;
 const SUBMIT_REDIRECT_SETTLE_MS = 1_500;
+
+/**
+ * How the booking POST is fired at the tick. Env-switchable for rollback:
+ *
+ *   SUBMIT_VIA=fetch (default) — serialize the real <form> (FormData → all
+ *     hidden fields included) and POST it via fetch() inside the page context.
+ *     The wire request matches a form submit; the page never navigates, so a
+ *     failed attempt retries the next court without any goto, and the response
+ *     HTML (including alert() copy) is read directly. ~50ms to POST vs
+ *     190-540ms for a real click under 17-page contention.
+ *
+ *   SUBMIT_VIA=click — the previous behavior: real submit-button click
+ *     (noWaitAfter) + observe the POST response. Kept as the .env rollback.
+ */
+export type SubmitVia = 'fetch' | 'click';
+export function submitVia(): SubmitVia {
+  return process.env.SUBMIT_VIA === 'click' ? 'click' : 'fetch';
+}
 
 /**
  * Grace retry window for soft-hold slot recovery at T+0.
@@ -366,15 +391,17 @@ export async function fetchAllReservedTimes(
  * server's own reason on race-loss ("มีผู้จองแล้ว" etc.) — used for detection
  * and for a human-readable fail_reason.
  */
-async function classifySubmissionResult(
-  page: Page,
+function classifyOutcome(
+  finalUrl: string,
+  text: string,
   username: string,
-  dialogMessages: string[] = []
-): Promise<AttemptOutcome> {
-  const url = page.url();
-  const bodyText = (await page.locator('body').textContent().catch(() => '')) ?? '';
-  // Search both the rendered page and any captured dialog text.
-  const haystacks = [bodyText, ...dialogMessages];
+  extraMessages: string[]
+): AttemptOutcome {
+  // Search both the page content and any captured alert/dialog text.
+  // `text` is rendered body text on the click path and raw HTML on the fetch
+  // path — every indicator is a Thai/English phrase that appears verbatim in
+  // both representations.
+  const haystacks = [text, ...extraMessages];
   const matches = (indicators: string[]): boolean =>
     haystacks.some((h) => indicators.some((s) => h.includes(s)));
 
@@ -387,15 +414,15 @@ async function classifySubmissionResult(
   //    appears in a booking row. Both conditions are required — a redirect
   //    without our row, or our username on some other page, is not proof.
   const onReservationsPage =
-    url.includes(RESERVATIONS_URL_MARKER) || bodyText.includes(RESERVATION_PAGE_HEADER);
-  const myRowPresent = bodyText.includes(username);
+    finalUrl.includes(RESERVATIONS_URL_MARKER) || text.includes(RESERVATION_PAGE_HEADER);
+  const myRowPresent = text.includes(username);
   if (onReservationsPage && myRowPresent) {
     return { type: 'success' };
   }
 
   // 3. Explicit failure (race-loss / server error) — caller retries next court.
   if (matches(FAILURE_INDICATORS)) {
-    const reason = (dialogMessages[0] ?? bodyText).replace(/\s+/g, ' ').trim().slice(0, 200);
+    const reason = (extraMessages[0] ?? text).replace(/\s+/g, ' ').trim().slice(0, 200);
     return { type: 'submit-fail', reason: reason || 'server reported failure' };
   }
 
@@ -407,10 +434,33 @@ async function classifySubmissionResult(
 
   // 5. Anything else — including a bounce back to the empty booking form — is
   //    NOT a booking. This is the case the old code wrongly called PASS.
-  const reason = dialogMessages.length
-    ? `dialog: ${dialogMessages.join(' | ').slice(0, 180)}`
-    : `no booking confirmed (url=${url})`;
+  const reason = extraMessages.length
+    ? `dialog: ${extraMessages.join(' | ').slice(0, 180)}`
+    : `no booking confirmed (url=${finalUrl})`;
   return { type: 'submit-fail', reason };
+}
+
+async function classifySubmissionResult(
+  page: Page,
+  username: string,
+  dialogMessages: string[] = []
+): Promise<AttemptOutcome> {
+  const bodyText = (await page.locator('body').textContent().catch(() => '')) ?? '';
+  return classifyOutcome(page.url(), bodyText, username, dialogMessages);
+}
+
+/** Pull the message strings out of any alert('...')/confirm("...") calls in a
+ *  returned HTML page. The server reports race-loss and validation errors this
+ *  way; on the fetch path the script never executes, so we read it instead. */
+export function extractAlertMessages(html: string): string[] {
+  const out: string[] = [];
+  const re = /(?:alert|confirm)\s*\(\s*(['"])([\s\S]*?)\1\s*\)/g;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(html)) !== null) {
+    const msg = m[2].trim();
+    if (msg) out.push(msg);
+  }
+  return out;
 }
 
 /**
@@ -482,6 +532,234 @@ async function clickSubmitAndAwaitOutcome(
   return { dialogMessages, postObserved, postDelayMs };
 }
 
+// ---------- fetch submit path (SUBMIT_VIA=fetch, the default) ----------
+
+interface PageFetchResult {
+  ok: boolean;
+  error?: string;
+  status?: number;
+  url?: string;
+  text?: string;
+}
+
+/**
+ * Set (or inject) the #court/#time selections and POST the REAL booking form
+ * via fetch() inside the page — one page.evaluate round-trip, ~50ms to the
+ * wire vs 190-540ms for a click under 17-page contention.
+ *
+ * Fidelity to a native submit:
+ *   - the body is `new FormData(form)` serialized, so every hidden field the
+ *     form carries is included (we never hand-build the params);
+ *   - if the submit control has a `name`, its name=value pair is appended,
+ *     exactly as a real click would (FormData alone omits the submitter — a
+ *     PHP `isset($_POST['submit'])` gate would otherwise reject us);
+ *   - same-origin cookies ride along; redirects are followed so `url`/`text`
+ *     describe the FINAL page (reservations.php on success).
+ *
+ * When an option is missing from a STALE dropdown (yesterday's data omits
+ * fully-booked courts until the 12:00 reset), it is injected before
+ * serializing — the server validates court/slot itself, the <option> list is
+ * presentation only. `courtValue === null` means "keep whatever the prewarm
+ * already selected" (page-ready fast path).
+ */
+async function setSelectionAndSubmitViaFetch(
+  page: Page,
+  courtValue: string | null,
+  courtLabel: string,
+  slot: string
+): Promise<PageFetchResult> {
+  return await page.evaluate(
+    async (args) => {
+      const courtSel = document.querySelector('#court') as HTMLSelectElement | null;
+      const timeSel = document.querySelector('#time') as HTMLSelectElement | null;
+      const form =
+        (courtSel?.closest('form') as HTMLFormElement | null) ??
+        (document.querySelector('form') as HTMLFormElement | null);
+      if (!form || !courtSel || !timeSel) {
+        return { ok: false, error: 'booking form/selects not found on page' };
+      }
+      const ensure = (sel: HTMLSelectElement, value: string, label: string): void => {
+        if (!Array.from(sel.options).some((o) => o.value === value)) {
+          sel.add(new Option(label, value));
+        }
+        sel.value = value;
+      };
+      if (args.courtValue) ensure(courtSel, args.courtValue, args.courtLabel);
+      ensure(timeSel, args.slot, args.slot);
+
+      const actionAttr = form.getAttribute('action');
+      const action = actionAttr
+        ? new URL(actionAttr, window.location.href).toString()
+        : window.location.href;
+      const method = (form.getAttribute('method') ?? 'post').toUpperCase();
+      const params = new URLSearchParams(new FormData(form) as unknown as string[][]);
+      const submitter = form.querySelector(
+        'button[type="submit"], input[type="submit"], button:not([type])'
+      ) as HTMLButtonElement | HTMLInputElement | null;
+      if (submitter && submitter.name) {
+        params.append(submitter.name, submitter.value ?? '');
+      }
+
+      try {
+        const res = await fetch(action, {
+          method,
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: params.toString(),
+          credentials: 'same-origin',
+          redirect: 'follow',
+        });
+        const text = await res.text();
+        return { ok: true, status: res.status, url: res.url, text };
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
+    },
+    { courtValue, courtLabel, slot }
+  );
+}
+
+/**
+ * Fetch reservations.php through the page's own session and check whether OUR
+ * username appears as a table-cell text node (`>username<`) — the cell-level
+ * match means a site-wide "logged in as X" echo can never count as a booking
+ * row. Used to double-check ambiguous submit outcomes.
+ */
+async function verifyBookedOnReservations(page: Page, username: string): Promise<boolean> {
+  try {
+    const res: PageFetchResult = await page.evaluate(async () => {
+      try {
+        const r = await fetch('reservations.php', { credentials: 'same-origin' });
+        return { ok: true, status: r.status, url: r.url, text: await r.text() };
+      } catch (e) {
+        return { ok: false, error: String(e) };
+      }
+    });
+    if (!res.ok || !res.text) return false;
+    if (!res.text.includes(RESERVATION_PAGE_HEADER)) return false;
+    const esc = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    return new RegExp(`>\\s*${esc}\\s*<`).test(res.text);
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Safety net for ambiguous submit results: before trusting any non-success
+ * outcome, look at the reservations page — if our row is there, the booking
+ * happened regardless of what the response looked like. This closes two
+ * failure classes seen on 2026-08-22:
+ *   - "booked but reported ERROR/FAIL" (response lost/odd → we would have
+ *     misreported an actual booking), and
+ *   - the double-submit that follows it (a retry on another court while the
+ *     first POST had in fact succeeded).
+ * A negative check is NOT proof of failure (the reservations view may window
+ * its rows), so it only ever upgrades an outcome, never downgrades one.
+ */
+async function confirmViaReservationsIfUnclear(
+  page: Page,
+  username: string,
+  outcome: AttemptOutcome
+): Promise<AttemptOutcome> {
+  if (outcome.type === 'success') return outcome;
+  const booked = await verifyBookedOnReservations(page, username);
+  return booked ? { type: 'success' } : outcome;
+}
+
+/**
+ * One fetch-mode booking attempt for (court, slot): set/inject selections,
+ * POST the form, classify the response (alerts included), and double-check
+ * reservations on anything that is not a clear success. The page never
+ * navigates, so the caller can retry the next court with no reset/goto.
+ */
+async function attemptBookingFetch(
+  page: Page,
+  court: CourtInfo,
+  slot: string,
+  username: string,
+  preselected = false
+): Promise<AttemptOutcome> {
+  const t0 = Date.now();
+  const res = await setSelectionAndSubmitViaFetch(
+    page,
+    preselected ? null : court.value,
+    court.label,
+    slot
+  );
+  if (!res.ok) {
+    return { type: 'submit-fail', reason: `fetch submit failed: ${res.error ?? 'unknown'}` };
+  }
+  const alerts = extractAlertMessages(res.text ?? '');
+  let outcome = classifyOutcome(res.url ?? page.url(), res.text ?? '', username, alerts);
+  outcome = await confirmViaReservationsIfUnclear(page, username, outcome);
+  console.log(
+    `[perf] ${username} fetch_submit court=${court.label} slot=${slot} ` +
+      `post=${Date.now() - t0}ms status=${res.status ?? '-'} outcome=${outcome.type}`
+  );
+  return outcome;
+}
+
+/** Mode dispatch used by the retry loop: fetch (default) or the click path. */
+async function attemptBooking(
+  page: Page,
+  court: CourtInfo,
+  slot: string,
+  username: string
+): Promise<AttemptOutcome> {
+  return submitVia() === 'fetch'
+    ? attemptBookingFetch(page, court, slot, username)
+    : attemptSubmitBooking(page, court, slot, username);
+}
+
+/**
+ * On success the fetch path never navigated, so park the page on
+ * reservations.php before the §7 proof screenshot — the shot then shows the
+ * actual booking row. Best-effort: on any error the current page is shot.
+ */
+async function gotoReservationsProof(page: Page): Promise<void> {
+  try {
+    const target = new URL('reservations.php', page.url()).toString();
+    await page.goto(target, { waitUntil: 'domcontentloaded', timeout: 5000 });
+  } catch {
+    /* keep whatever page we have — screenshot still taken */
+  }
+}
+
+// ---------- timed, non-blocking cleanup ----------
+
+const CLOSE_HANG_WARN_MS = 30_000;
+
+/**
+ * Run a close() with a per-step timing log and a 30s hang watchdog. Returns
+ * once the close completes OR the watchdog fires — in the latter case the
+ * close keeps running detached and a follow-up line logs when (if) it finally
+ * finishes. Never throws. Used for every context/browser teardown so a hung
+ * Chrome shutdown can no longer sit between "booking done" and "results
+ * delivered" (the unexplained ~11-minute gap of 2026-08-22).
+ */
+export async function closeWithTiming(tag: string, close: () => Promise<void>): Promise<void> {
+  const t0 = Date.now();
+  const closing = close().catch(() => {});
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = await Promise.race([
+    closing.then(() => false),
+    new Promise<boolean>((resolve) => {
+      timer = setTimeout(() => resolve(true), CLOSE_HANG_WARN_MS);
+      timer.unref?.();
+    }),
+  ]);
+  if (timer) clearTimeout(timer);
+  if (timedOut) {
+    console.warn(
+      `[cleanup] ${tag} close hung >${CLOSE_HANG_WARN_MS}ms — continuing in background`
+    );
+    void closing.then(() =>
+      console.warn(`[cleanup] ${tag} close finally finished after ${Date.now() - t0}ms`)
+    );
+    return;
+  }
+  console.log(`[cleanup] ${tag} close=${Date.now() - t0}ms`);
+}
+
 /**
  * Noon fast path for a deep-prewarmed page. Court and slot were selected at
  * T-5min, so this function arms request telemetry and clicks confirm without
@@ -512,7 +790,8 @@ async function attemptSubmitPreselectedBooking(
       `post_observed=${outcome.postObserved} url=${page.url()}`
   );
 
-  return classifySubmissionResult(page, username, outcome.dialogMessages);
+  const classified = await classifySubmissionResult(page, username, outcome.dialogMessages);
+  return confirmViaReservationsIfUnclear(page, username, classified);
 }
 
 async function attemptSubmitBooking(
@@ -567,7 +846,8 @@ async function attemptSubmitBooking(
     `[perf] attempt court=${court.label} slot=${slot} submit=${Date.now() - tSubmit}ms ` +
       `post_observed=${outcome.postObserved} url=${page.url()}`
   );
-  return classifySubmissionResult(page, username, outcome.dialogMessages);
+  const classified = await classifySubmissionResult(page, username, outcome.dialogMessages);
+  return confirmViaReservationsIfUnclear(page, username, classified);
 }
 
 /**
@@ -710,17 +990,22 @@ export async function bookOneAccount(
         return result;
       }
 
-      const outcome = await attemptSubmitPreselectedBooking(
-        page,
-        account.username,
-        courtLabel,
-        account.slot
-      );
+      const outcome =
+        submitVia() === 'fetch'
+          ? await attemptBookingFetch(
+              page,
+              { label: courtLabel, value: options.prewarmedCourtValue ?? '' },
+              account.slot,
+              account.username,
+              /* preselected — reuse the values already set at T-5min */ true
+            )
+          : await attemptSubmitPreselectedBooking(page, account.username, courtLabel, account.slot);
       if (outcome.type === 'success') {
         result.attempts.push({ court: courtLabel, slot: account.slot, outcome: 'success' });
         result.court_booked = courtLabel;
         result.status = 'PASS';
         result.fail_reason = null;
+        if (!page.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(page);
         await shoot(page, screenshot);
         return result;
       }
@@ -749,12 +1034,78 @@ export async function bookOneAccount(
       // Only a failed fast-confirm is allowed to enter the slower discovery +
       // fallback path. Restore booking.php if the submit response navigated away.
       await resetToBookingPage(page);
-    } else if (options.prewarmedLoginPage) {
-      // Pre-warm path: caller already navigated to login.php and filled the form.
-      // Click immediately; the engine owns and closes this context.
-      page = options.prewarmedLoginPage;
-      await page.locator('input[type="submit"]').click();
-      await page.waitForLoadState('domcontentloaded', { timeout: 5000 }).catch(() => null);
+    } else if (options.loginReadyPage) {
+      // ---- Login-ready path ----
+      // Logged in at T-5min but pre-select was impossible (the 11:55 dropdown
+      // still showed yesterday's data and omitted the target court). Engine
+      // owns the context. Fast path: inject the first priority court whose
+      // dropdown id we have cached and POST on the STALE page — no reload.
+      page = options.loginReadyPage;
+      const cachedTarget = priorityCourts
+        .map((label) => ({ label, value: getCourtId(label) }))
+        .find((c): c is CourtInfo => c.value !== undefined);
+
+      if (options.dryRun) {
+        const plan = cachedTarget
+          ? `inject+submit ${cachedTarget.label}`
+          : `reload+select ${priorityCourts[0] ?? '?'}`;
+        result.attempts.push({
+          court: cachedTarget?.label ?? priorityCourts[0] ?? '-',
+          slot: account.slot,
+          outcome: 'dry-run-would-book',
+        });
+        result.court_booked = cachedTarget?.label ?? priorityCourts[0] ?? null;
+        result.status = 'DRY-RUN';
+        result.fail_reason = `login-ready: would ${plan}/${account.slot} (submit skipped)`;
+        await shoot(page, screenshot);
+        return result;
+      }
+
+      if (submitVia() === 'fetch' && cachedTarget) {
+        const outcome = await attemptBookingFetch(
+          page,
+          cachedTarget,
+          account.slot,
+          account.username
+        );
+        if (outcome.type === 'success') {
+          result.attempts.push({ court: cachedTarget.label, slot: account.slot, outcome: 'success' });
+          result.court_booked = cachedTarget.label;
+          result.status = 'PASS';
+          result.fail_reason = null;
+          if (!page.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(page);
+          await shoot(page, screenshot);
+          return result;
+        }
+        if (outcome.type === 'already-booked') {
+          result.attempts.push({
+            court: cachedTarget.label,
+            slot: account.slot,
+            outcome: 'submit-fail',
+            reason: 'already-booked',
+          });
+          result.status = 'FAIL';
+          result.fail_reason = 'server: already booked today';
+          await shoot(page, screenshot);
+          return result;
+        }
+        result.attempts.push({
+          court: cachedTarget.label,
+          slot: account.slot,
+          outcome: 'submit-fail',
+          reason: outcome.type === 'submit-fail' ? outcome.reason : undefined,
+        });
+      }
+
+      // Fall through: reload for the fresh post-reset dropdown, then the
+      // normal discovery + retry loop below.
+      const tReload = Date.now();
+      await page.goto(new URL('booking.php', page.url()).toString(), {
+        waitUntil: 'domcontentloaded',
+        timeout: 15000,
+      });
+      await page.waitForSelector('#court', { timeout: 10000 }).catch(() => null);
+      console.log(`[perf] ${account.username} login_ready_reload=${Date.now() - tReload}ms`);
     } else {
       // Standard path: create the account's isolated context, navigate, fill,
       // and submit. Prewarmed paths already own their isolated contexts.
@@ -795,13 +1146,30 @@ export async function bookOneAccount(
     // handler shows in the #time dropdown — so we don't need a separate dropdown
     // read per court (saves ~500ms × courts-to-try).
     const allBadmintonCourts = await getBadmintonCourts(page);
-    const courtValues = allBadmintonCourts.map((c) => c.value);
+    // Opportunistic cache merge: every fresh dropdown read teaches us stable
+    // court ids that the login-ready fast path relies on tomorrow.
+    updateCourtIds(allBadmintonCourts);
+
+    // In fetch mode, courts MISSING from the rendered dropdown can still be
+    // tried by injecting their cached id — the dropdown omits fully-booked
+    // courts, but post-reset those may be exactly the open ones. This keeps
+    // the §3.4 priority coverage even when the DOM under-reports.
+    const knownCourts: CourtInfo[] = [...allBadmintonCourts];
+    if (submitVia() === 'fetch') {
+      for (const label of priorityCourts) {
+        if (knownCourts.some((c) => c.label === label)) continue;
+        const value = getCourtId(label);
+        if (value !== undefined) knownCourts.push({ label, value });
+      }
+    }
+
+    const courtValues = knownCourts.map((c) => c.value);
     const tFetchStd = Date.now();
     const reservedByValue = await fetchAllReservedTimes(page, courtValues);
     console.log(`[perf] ${account.username} fetch_reserved=${Date.now() - tFetchStd}ms`);
 
     const availableByValue = new Map<string, string[]>();
-    for (const court of allBadmintonCourts) {
+    for (const court of knownCourts) {
       const reserved = reservedByValue.get(court.value) ?? [];
       const available = ALL_SLOTS.filter((s) => !reserved.includes(s));
       availableByValue.set(court.value, available);
@@ -809,7 +1177,7 @@ export async function bookOneAccount(
 
     // ---- Retry-with-fallback loop ----
     const deadline = Date.now() + deadlineMs;
-    const courtsToTry = buildCourtPriority(priorityCourts, allBadmintonCourts);
+    const courtsToTry = buildCourtPriority(priorityCourts, knownCourts);
 
     let booked: { court: string; slot: string } | null = null;
     let earlyExit: 'already-booked' | null = null;
@@ -833,11 +1201,11 @@ export async function bookOneAccount(
         court.label === priorityCourts[0] &&
         Date.now() - start < MAX_GRACE_MS
       ) {
-        if (!onBookingPage) {
+        if (submitVia() === 'click' && !onBookingPage) {
           await resetToBookingPage(page);
           onBookingPage = true;
         }
-        const graceOutcome = await attemptSubmitBooking(page, court, account.slot, account.username);
+        const graceOutcome = await attemptBooking(page, court, account.slot, account.username);
         if (graceOutcome.type === 'success') {
           result.attempts.push({
             court: court.label,
@@ -885,14 +1253,14 @@ export async function bookOneAccount(
         break outer;
       }
 
-      // Real path: selectOption(court) + selectOption(slot) + submit. Race-loss
-      // with a parallel account is caught by the 3s selectOption timeout — the
-      // dropdown won't include the slot, so we skip and try the next (court, slot).
-      if (!onBookingPage) {
+      // Real path: fetch mode sets/injects the selections and POSTs the form
+      // (page stays put, so retries need no reset); click mode selects the
+      // dropdowns and clicks, navigating away on submit.
+      if (submitVia() === 'click' && !onBookingPage) {
         await resetToBookingPage(page);
         onBookingPage = true;
       }
-      const outcome = await attemptSubmitBooking(page, court, slot, account.username);
+      const outcome = await attemptBooking(page, court, slot, account.username);
       if (outcome.type === 'success') {
         result.attempts.push({ court: court.label, slot, outcome: 'success' });
         booked = { court: court.label, slot };
@@ -928,6 +1296,9 @@ export async function bookOneAccount(
       } else {
         result.status = 'PASS';
         result.fail_reason = null;
+        // Fetch submits never navigate — park on reservations.php so the §7
+        // proof screenshot shows the booking row.
+        if (!page.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(page);
       }
       await shoot(page, screenshot);
       return result;
@@ -977,7 +1348,18 @@ export async function bookOneAccount(
     return result;
   } finally {
     result.duration_ms = Date.now() - start;
-    if (context) await context.close();
-    if (browser && ownBrowser) await browser.close();
+    // Cleanup off the critical path: browser teardown is where ~11 minutes
+    // disappeared after bookings finished on 2026-08-22. close() is still
+    // invoked on every exit path (BR-02), but detached + timed so a hung close
+    // can never delay the result/DMs — and the timing log finally names the
+    // culprit if it hangs again.
+    if (context) {
+      const ctx = context;
+      void closeWithTiming(`ctx ${account.username}`, () => ctx.close());
+    }
+    if (browser && ownBrowser) {
+      const b = browser;
+      void closeWithTiming(`browser ${account.username}`, () => b.close());
+    }
   }
 }

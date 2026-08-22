@@ -36,6 +36,8 @@ async function testWaitUsesInjectedLocalClock(): Promise<void> {
 }
 
 async function testDeepPrewarmClicksBeforeAnyOtherBrowserWork(): Promise<void> {
+  // This test exercises the CLICK submit path (the SUBMIT_VIA=click rollback).
+  process.env.SUBMIT_VIA = 'click';
   const events: string[] = [];
   let releaseClick: (() => void) | undefined;
   let newContextCalls = 0;
@@ -127,9 +129,75 @@ async function testDeepPrewarmClicksBeforeAnyOtherBrowserWork(): Promise<void> {
   assert.equal(events.includes('screenshot'), true);
 }
 
+async function testFetchModeDispatchesSubmitSynchronously(): Promise<void> {
+  // Default mode (SUBMIT_VIA unset → fetch): the noon submit is ONE
+  // page.evaluate that serializes and POSTs the form. It must be dispatched
+  // synchronously when bookOneAccount is called — that is what lets
+  // Promise.all fire all N accounts in the same JavaScript tick.
+  delete process.env.SUBMIT_VIA;
+  const events: string[] = [];
+  let newContextCalls = 0;
+
+  const page = {
+    url: () => 'https://susport.sc.su.ac.th/booking.php',
+    evaluate: (_fn: unknown, _args?: unknown) => {
+      events.push('evaluate-submit');
+      return Promise.resolve({
+        ok: true,
+        status: 200,
+        url: 'https://susport.sc.su.ac.th/reservations.php',
+        text:
+          '<h2>การจองสนามในวันที่ 2026-08-22</h2>' +
+          '<table><tr><td>fetch-test</td><td>แบดมินตัน2</td><td>18:30_19:30</td></tr></table>',
+      });
+    },
+    goto: async () => {
+      events.push('goto-proof');
+    },
+    screenshot: async () => {
+      events.push('screenshot');
+    },
+  } as unknown as Page;
+
+  const browser = {
+    newContext: async () => {
+      newContextCalls += 1;
+      throw new Error('fetch fast path must not create a dummy context');
+    },
+  } as unknown as Browser;
+
+  const booking = bookOneAccount(
+    {
+      username: 'fetch-test',
+      password: 'unused',
+      slot: '18:30_19:30',
+    },
+    {
+      browser,
+      courtPriority: ['แบดมินตัน2', 'แบดมินตัน1'],
+      prewarmedBookingPage: page,
+      prewarmedCourtLabel: 'แบดมินตัน2',
+      prewarmedCourtValue: '14',
+      screenshotsDir: '/tmp/court-booking-fast-confirm-test',
+    }
+  );
+
+  assert.equal(events[0], 'evaluate-submit', 'fetch submit must dispatch in the same tick');
+  assert.equal(newContextCalls, 0);
+
+  const result = await booking;
+  assert.equal(result.status, 'PASS');
+  assert.equal(result.court_booked, 'แบดมินตัน2');
+  // Success on the fetch path parks the page on reservations.php for the
+  // proof screenshot (the fetch itself never navigates).
+  assert.equal(events.includes('goto-proof'), true);
+  assert.equal(events.includes('screenshot'), true);
+}
+
 async function main(): Promise<void> {
   await testWaitUsesInjectedLocalClock();
   await testDeepPrewarmClicksBeforeAnyOtherBrowserWork();
+  await testFetchModeDispatchesSubmitSynchronously();
   console.log('fast-confirm regression tests: PASS');
 }
 
