@@ -33,6 +33,7 @@ import { Browser, BrowserContext, Page, chromium } from 'playwright';
 import {
   bookOneAccount,
   closeWithTiming,
+  submitVia,
   Account,
   BookingResult,
   FlowOptions,
@@ -40,7 +41,7 @@ import {
   fetchAllReservedTimes,
   buildCourtPriority,
 } from '../bookingFlow';
-import { updateCourtIds } from '../courtIdCache';
+import { getCourtId, updateCourtIds } from '../courtIdCache';
 import { waitUntilLocalTimestamp } from '../localClock';
 import { COURTS } from './configLoader';
 import { getOwner } from './userStore';
@@ -58,6 +59,43 @@ export function prewarmLeadMs(): number {
 // Transient-failure retry cadence inside the prewarm window.
 const RETRY_INTERVAL_MS = 30_000;
 const RETRY_STOP_BEFORE_MS = 40_000; // no retry starts after T-40s
+
+// ---------- same-slot de-confliction (2026-08-23 incident) ----------
+//
+// On the first live run, every account independently targeted "first priority
+// court with my slot open" — so ALL same-slot accounts fired at แบดมินตัน3.
+// 10/17 first POSTs were wasted racing our own siblings, and the server
+// ACCEPTED two duplicate (court, slot) rows and later deleted one of each
+// pair — and it deleted the EARLIER order number (#278/#277 gone, #286/#288
+// kept), i.e. duplicate resolution is a coin flip we cannot rely on.
+//
+// Fix: accounts sharing the same slot each get the court-priority list ROTATED
+// by their position in the group — member 0 starts at priority[0], member 1 at
+// priority[1], … wrapping. One mechanism drives everything: the prewarm
+// pre-select, the noon fast submit, the login-ready cached-id pick, and the
+// retry loop order (so retries spread instead of re-colliding too). Every list
+// is still the full court set, so §3.4 coverage is unchanged — only the
+// STARTING POINT differs per account.
+
+/** Position of each account within its same-slot group, in input order
+ *  (owner's accounts come first in the flat list, matching the pre-existing
+ *  dispatch bias). Pure — safe to call anywhere. */
+export function computeSlotRotations(accounts: Account[]): number[] {
+  const nextInGroup = new Map<string, number>();
+  return accounts.map((a) => {
+    const k = nextInGroup.get(a.slot) ?? 0;
+    nextInGroup.set(a.slot, k + 1);
+    return k;
+  });
+}
+
+/** The full priority list rotated to start at index k (mod length). */
+export function rotateCourts(priority: string[], k: number): string[] {
+  const n = priority.length;
+  if (n === 0) return [];
+  const r = ((k % n) + n) % n;
+  return [...priority.slice(r), ...priority.slice(0, r)];
+}
 
 // If the engine wakes up this far past the tick, the slot race is already
 // lost — surface a clear FAIL instead of probing for 30s per account.
@@ -111,8 +149,16 @@ function baseFlowOptions(browser: Browser, opts: BatchOptions): FlowOptions {
 /**
  * Prewarm ONE account: fresh context → login → booking.php → try to
  * pre-select (court, slot). Never throws; failures are encoded in `status`.
+ *
+ * `priority` is this account's ROTATED court list (de-confliction) — the
+ * pre-select targets its first open entry, so same-slot accounts pre-select
+ * different courts whenever the stale data allows it.
  */
-async function prewarmOne(browser: Browser, account: Account): Promise<PrewarmedAccount> {
+async function prewarmOne(
+  browser: Browser,
+  account: Account,
+  priority: string[]
+): Promise<PrewarmedAccount> {
   let context: BrowserContext | null = null;
   try {
     context = await browser.newContext({ storageState: undefined });
@@ -133,7 +179,7 @@ async function prewarmOne(browser: Browser, account: Account): Promise<Prewarmed
       updateCourtIds(courts); // teach the login-ready fast path its ids
       const courtValues = courts.map((c) => c.value);
       const reservedMap = await fetchAllReservedTimes(page, courtValues);
-      const prioritized = buildCourtPriority(COURTS, courts);
+      const prioritized = buildCourtPriority(priority, courts);
       const slotOpenSomewhere = prioritized.some(
         (c) => !(reservedMap.get(c.value) ?? []).includes(account.slot)
       );
@@ -243,10 +289,16 @@ export async function runStandard(
 ): Promise<EngineResult> {
   const start = Date.now();
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
+  // Same-slot de-confliction applies here too: each account walks the court
+  // list from its own rotated starting point.
+  const rotations = computeSlotRotations(accounts);
   try {
     const results = await Promise.all(
       accounts.map((account, i) =>
-        bookOneAccount(account, baseFlowOptions(browser, opts)).then((r) => {
+        bookOneAccount(account, {
+          ...baseFlowOptions(browser, opts),
+          courtPriority: rotateCourts(COURTS, rotations[i]),
+        }).then((r) => {
           try {
             opts.onAccountSettled?.(i, r);
           } catch {
@@ -287,8 +339,14 @@ export async function runPrewarmedBatch(
       await sleep(waitMs);
     }
 
+    // De-confliction: each account's rotated court list, fixed once from the
+    // input order and reused by prewarm, retries, and dispatch (indices are
+    // stable throughout).
+    const rotations = computeSlotRotations(accounts);
+    const priorities = rotations.map((k) => rotateCourts(COURTS, k));
+
     // Phase 1: prewarm all accounts in parallel.
-    entries = await Promise.all(accounts.map((a) => prewarmOne(browser, a)));
+    entries = await Promise.all(accounts.map((a, i) => prewarmOne(browser, a, priorities[i])));
     console.log(`[bookingEngine] prewarm: ${tallies(entries)}`);
     for (const e of entries) {
       if (e.status !== 'page-ready') {
@@ -309,7 +367,9 @@ export async function runPrewarmedBatch(
         .map((e, i) => (e.status === 'failed' ? i : -1))
         .filter((i) => i >= 0);
       console.log(`[bookingEngine] prewarm retry for ${failedIdx.length} failed account(s)`);
-      const retried = await Promise.all(failedIdx.map((i) => prewarmOne(browser, entries[i].account)));
+      const retried = await Promise.all(
+        failedIdx.map((i) => prewarmOne(browser, entries[i].account, priorities[i]))
+      );
       retried.forEach((r, k) => {
         entries[failedIdx[k]] = r;
       });
@@ -336,6 +396,47 @@ export async function runPrewarmedBatch(
     for (const e of entries) {
       if (e.page) await e.page.evaluate(() => 1).catch(() => null);
     }
+
+    // Phase 1e: resolve each account's noon target BEFORE the tick — nothing
+    // but the dispatch itself may sit between 12:00:00.000 and the submits.
+    //
+    // page-ready + fetch mode: if the prewarm pre-selected a court that is NOT
+    // this account's assigned rotation head (stale data forced an alt), and
+    // the assigned court's id is cached (refreshed minutes ago by every
+    // prewarm dropdown read), RETARGET the submit to the assigned court — the
+    // fetch path injects the value at submit time, no DOM re-select needed.
+    // Post-reset the assigned court is normally open; if not, the server
+    // rejects and the ROTATED retry loop recovers. Click mode never retargets
+    // (it would need the option present in the stale dropdown).
+    const dispatchPlan = entries.map((e, i) => {
+      const priority = priorities[i];
+      let courtLabel = e.courtLabel;
+      let courtValue = e.courtValue;
+      const assigned = priority[0];
+      if (
+        e.status === 'page-ready' &&
+        submitVia() === 'fetch' &&
+        assigned !== undefined &&
+        assigned !== e.courtLabel
+      ) {
+        const cachedId = getCourtId(assigned);
+        if (cachedId !== undefined) {
+          courtLabel = assigned;
+          courtValue = cachedId;
+        }
+      }
+      return { courtLabel, courtValue, priority };
+    });
+    console.log(
+      `[bookingEngine] targets: ` +
+        entries
+          .map((e, i) => {
+            const plan = dispatchPlan[i];
+            const retargeted = e.status === 'page-ready' && plan.courtLabel !== e.courtLabel;
+            return `${e.account.username}→${plan.courtLabel ?? plan.priority[0] ?? '?'}/${e.account.slot}${retargeted ? '*' : ''}`;
+          })
+          .join(' ')
+    );
 
     // Phase 2: the exact local tick (SC-01/SC-04).
     await waitUntilLocalTimestamp(targetTime.getTime());
@@ -376,14 +477,15 @@ export async function runPrewarmedBatch(
     // Phase 3: single synchronous dispatch across ALL accounts.
     const results = await Promise.all(
       entries.map((e, i) => {
-        const base = baseFlowOptions(browser, opts);
+        const plan = dispatchPlan[i];
+        const base = { ...baseFlowOptions(browser, opts), courtPriority: plan.priority };
         let p: Promise<BookingResult>;
         if (e.status === 'page-ready' && e.page) {
           p = bookOneAccount(e.account, {
             ...base,
             prewarmedBookingPage: e.page,
-            prewarmedCourtLabel: e.courtLabel,
-            prewarmedCourtValue: e.courtValue,
+            prewarmedCourtLabel: plan.courtLabel,
+            prewarmedCourtValue: plan.courtValue,
           });
         } else if (e.status === 'login-ready' && e.page) {
           p = bookOneAccount(e.account, { ...base, loginReadyPage: e.page });

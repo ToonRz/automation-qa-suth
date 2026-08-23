@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import type { Browser, Page } from 'playwright';
 import { bookOneAccount } from '../bookingFlow';
 import { waitUntilLocalTimestamp } from '../localClock';
+import { computeSlotRotations, rotateCourts } from './bookingEngine';
 
 async function testWaitUsesInjectedLocalClock(): Promise<void> {
   let now = 1_000;
@@ -194,8 +195,41 @@ async function testFetchModeDispatchesSubmitSynchronously(): Promise<void> {
   assert.equal(events.includes('screenshot'), true);
 }
 
+function testSlotDeconflictionMath(): void {
+  const P = ['แบด3', 'แบด2', 'แบด1', 'แบด4', 'แบด5', 'แบด6'];
+  const acc = (username: string, slot: string) => ({ username, password: 'x', slot });
+
+  // Same-slot accounts get consecutive rotations, per-slot groups independent,
+  // input order preserved (2026-08-23 incident: 5 accounts × 20:30 all fired
+  // at แบด3 — with this, they start at 5 DIFFERENT courts).
+  const rotations = computeSlotRotations([
+    acc('a', '20:30_21:30'),
+    acc('b', '19:30_20:30'),
+    acc('c', '20:30_21:30'),
+    acc('d', '20:30_21:30'),
+    acc('e', '19:30_20:30'),
+  ]);
+  assert.deepEqual(rotations, [0, 0, 1, 2, 1]);
+
+  // Rotation is the full list starting at k — coverage never shrinks.
+  assert.deepEqual(rotateCourts(P, 0), P);
+  assert.deepEqual(rotateCourts(P, 2), ['แบด1', 'แบด4', 'แบด5', 'แบด6', 'แบด3', 'แบด2']);
+  assert.deepEqual(rotateCourts(P, 6), P); // wraps past the court count
+  assert.deepEqual(rotateCourts(P, 7), rotateCourts(P, 1));
+  assert.deepEqual(rotateCourts([], 3), []);
+  for (let k = 0; k < 8; k++) {
+    assert.deepEqual([...rotateCourts(P, k)].sort(), [...P].sort(), `k=${k} keeps full coverage`);
+  }
+
+  // First targets of a 6-member same-slot group are 6 DISTINCT courts.
+  const sameSlot = ['u1', 'u2', 'u3', 'u4', 'u5', 'u6'].map((u) => acc(u, '21:30_22:30'));
+  const firsts = computeSlotRotations(sameSlot).map((k) => rotateCourts(P, k)[0]);
+  assert.equal(new Set(firsts).size, 6);
+}
+
 async function main(): Promise<void> {
   await testWaitUsesInjectedLocalClock();
+  testSlotDeconflictionMath();
   await testDeepPrewarmClicksBeforeAnyOtherBrowserWork();
   await testFetchModeDispatchesSubmitSynchronously();
   console.log('fast-confirm regression tests: PASS');

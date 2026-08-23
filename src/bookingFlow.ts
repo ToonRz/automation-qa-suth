@@ -99,9 +99,11 @@ export interface FlowOptions {
    */
   prewarmedCourtLabel?: string;
   /**
-   * Dropdown value id of the pre-selected court (page-ready). Used by the
-   * fetch submit path for logging/telemetry; the submit itself reuses the
-   * values already selected in the DOM, so this is informational.
+   * Dropdown value id of the court to SUBMIT for (page-ready). In fetch mode
+   * the submit sets/injects this value explicitly, which lets the engine
+   * retarget the account to its de-conflicted court at fire time even when
+   * the prewarm pre-selected a different one. When omitted, the submit trusts
+   * whatever the prewarm left selected in the DOM.
    */
   prewarmedCourtValue?: string;
   /**
@@ -990,6 +992,11 @@ export async function bookOneAccount(
         return result;
       }
 
+      // Fetch mode: when the engine supplies a court VALUE, set/inject it at
+      // submit time (single evaluate — same cost as trusting the DOM). This is
+      // what lets the engine RETARGET a page-ready account to its de-conflicted
+      // court without touching the dropdown beforehand. Only when no value is
+      // supplied do we fall back to whatever the prewarm left selected.
       const outcome =
         submitVia() === 'fetch'
           ? await attemptBookingFetch(
@@ -997,7 +1004,7 @@ export async function bookOneAccount(
               { label: courtLabel, value: options.prewarmedCourtValue ?? '' },
               account.slot,
               account.username,
-              /* preselected — reuse the values already set at T-5min */ true
+              /* preselected= */ !options.prewarmedCourtValue
             )
           : await attemptSubmitPreselectedBooking(page, account.username, courtLabel, account.slot);
       if (outcome.type === 'success') {
