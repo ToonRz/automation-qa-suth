@@ -58,21 +58,48 @@ interface UsersFile {
 }
 
 let cache: UsersFile | null = null;
+// mtimeMs of the file contents currently in `cache`. Recorded only after a
+// successful parse (and after our own save()), so a torn read can't latch a
+// bad mtime and leave the cache stale for the rest of the process's life.
+let cachedMtimeMs = 0;
 
 function load(): UsersFile {
-  if (cache) return cache;
   if (!fs.existsSync(USERS_PATH)) {
     throw new Error(
       `users.json not found at ${USERS_PATH}. Copy config/users.example.json to config/users.json and fill in credentials.`
     );
   }
-  const raw = fs.readFileSync(USERS_PATH, 'utf-8');
-  const parsed = JSON.parse(raw) as UsersFile;
-  if (!Array.isArray(parsed.users)) {
-    throw new Error(`users.json: top-level "users" must be an array`);
+  // The bot runs for days under launchd, so hand-edits to users.json have to
+  // be picked up without a restart: re-read whenever the file's mtime differs
+  // from the one that produced the cache. This also stops the mutators below
+  // (markPending, setCronEnabled, ...) from writing a stale cache back over a
+  // hand-edit — they are all load-modify-save, and load() now refreshes first.
+  // Deadline is still the 11:55 cron fire, which snapshots the account list.
+  const st = fs.statSync(USERS_PATH);
+  if (cache && st.mtimeMs === cachedMtimeMs) return cache;
+
+  try {
+    const raw = fs.readFileSync(USERS_PATH, 'utf-8');
+    const parsed = JSON.parse(raw) as UsersFile;
+    if (!Array.isArray(parsed.users)) {
+      throw new Error(`users.json: top-level "users" must be an array`);
+    }
+    cache = parsed;
+    cachedMtimeMs = st.mtimeMs;
+    return cache;
+  } catch (err) {
+    // First load has nothing to fall back to — fail loudly, as before.
+    if (!cache) throw err;
+    // Read landed mid-write, or someone saved broken JSON. Keep serving the
+    // previous cache and deliberately do NOT record the mtime, so the next
+    // call retries. Throwing here would take out the noon path.
+    console.warn(
+      `[userStore] users.json unreadable (${
+        err instanceof Error ? err.message : String(err)
+      }) — keeping previous cache`
+    );
+    return cache;
   }
-  cache = parsed;
-  return cache;
 }
 
 function save(data: UsersFile): void {
@@ -83,6 +110,9 @@ function save(data: UsersFile): void {
   // chmod to owner-only since this file contains passwords
   fs.chmodSync(USERS_PATH, 0o600);
   cache = data;
+  // Record the mtime we just wrote so load() doesn't re-read our own write.
+  // Stat after rename+chmod: chmod moves ctime, not mtime.
+  cachedMtimeMs = fs.statSync(USERS_PATH).mtimeMs;
 }
 
 export function getUserByChatId(chatId: number): User | undefined {
@@ -219,4 +249,5 @@ export function addUser(input: Omit<User, 'accounts' | 'pending_booking' | 'last
 /** Test helper — clear in-memory cache so file edits are picked up. */
 export function reload(): void {
   cache = null;
+  cachedMtimeMs = 0;
 }
