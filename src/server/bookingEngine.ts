@@ -44,6 +44,7 @@ import {
 import { getCourtId, updateCourtIds } from '../courtIdCache';
 import { waitUntilLocalTimestamp } from '../localClock';
 import { COURTS } from './configLoader';
+import { sendTelegramMessage } from './telegramSend';
 import { getOwner } from './userStore';
 
 const LOGIN_URL = 'https://susport.sc.su.ac.th/login.php';
@@ -59,6 +60,39 @@ export function prewarmLeadMs(): number {
 // Transient-failure retry cadence inside the prewarm window.
 const RETRY_INTERVAL_MS = 30_000;
 const RETRY_STOP_BEFORE_MS = 40_000; // no retry starts after T-40s
+/** Share of the REMAINING prewarm window one round (the initial pass or a
+ *  retry) may consume before it is abandoned.
+ *
+ *  The per-step Playwright timeouts do NOT bound a round: on 2026-08-31 every
+ *  goto capped out at 20s as designed, yet Phase 1 still ran 10m11s, because
+ *  tearing down 17 dead contexts serialized on the single CDP pipe. The round
+ *  ended 5m past noon, so the retry loop below found its deadline long gone and
+ *  never ran once.
+ *
+ *  A fraction, not a fixed budget, because the two things it trades off both
+ *  scale with the window: leave enough for at least one retry, but stay far
+ *  clear of a healthy round (17 accounts took 10.9s / 12.1s / 16.5s / 21.4s on
+ *  2026-08-23..27). At the production 300s lead a round gets ~130s — 6x the
+ *  worst good run — and each retry takes half of whatever is left after it. */
+const PREWARM_ROUND_BUDGET_FRACTION = 0.5;
+/** Floor for the above, so a short rehearsal lead still gets a usable round. */
+const PREWARM_ROUND_MIN_MS = 30_000;
+
+/** Deadline for the round starting now, never past `retryDeadline` (T-40s). */
+function roundDeadline(retryDeadline: number): number {
+  const now = Date.now();
+  const remaining = retryDeadline - now;
+  if (remaining <= 0) return now;
+  const budget = Math.max(
+    PREWARM_ROUND_MIN_MS,
+    Math.floor(remaining * PREWARM_ROUND_BUDGET_FRACTION)
+  );
+  return Math.min(now + budget, retryDeadline);
+}
+/** How far before targetTime the total-outage DM fires. Armed on the WALL CLOCK
+ *  rather than after Phase 1 — the run where this alert matters most is exactly
+ *  the run where Phase 1 does not return in time to send it. */
+const OUTAGE_ALERT_BEFORE_MS = 240_000; // T-4m
 
 // ---------- same-slot de-confliction (2026-08-23 incident) ----------
 //
@@ -193,6 +227,10 @@ async function prewarmOne(
           const s = document.querySelector('select#time');
           return !!s && s.children.length > 1;
         },
+        // waitForFunction is (fn, arg, options) — options must be param 3. With
+        // { timeout } in the arg slot Playwright silently used its 30s default,
+        // which ate the prewarm window (16/17 pre-selects, 2026-08-26 rehearsal).
+        undefined,
         { timeout: 5000 }
       );
       await page.locator('select#time').selectOption({ value: account.slot }, { timeout: 5000 });
@@ -221,7 +259,17 @@ async function prewarmOne(
   } catch (err) {
     // Login/navigation broke — transient candidates (goto timeout, network).
     const message = err instanceof Error ? err.message : String(err);
-    if (context) await context.close().catch(() => null);
+    // DETACHED close. On a dead network context.close() hangs just like
+    // browser.close() does (2026-08-26: 17 unbounded closes turned a 20s goto
+    // timeout into a 12m24s prewarm). Bounding each close at 30s was still not
+    // enough — on 2026-08-31 the 17 bounded closes serialized on the one CDP
+    // pipe and cost ~10 minutes anyway, because this path AWAITED them. The
+    // context is dead and this account's outcome is already decided, so nothing
+    // here needs the close to finish: fire it and return.
+    if (context) {
+      const ctx = context;
+      void closeWithTiming(`prewarm ctx ${account.username}`, () => ctx.close());
+    }
     return { account, context: null, page: null, status: 'failed', error: message.split('\n')[0] };
   }
 }
@@ -232,6 +280,68 @@ function tallies(entries: PrewarmedAccount[]): string {
     `${count('page-ready')} page-ready / ${count('login-ready')} login-ready / ` +
     `${count('needs-standard')} needs-standard / ${count('failed')} failed`
   );
+}
+
+/** One entry per account, all 'failed', created BEFORE any prewarm runs.
+ *  Two things depend on this: the outage timer can read real partial state
+ *  while a round is still in flight, and an account whose round never returns
+ *  keeps an honest status — 'failed' routes it to the standard full-login path
+ *  at noon, which is exactly what an unfinished prewarm deserves. */
+function pendingEntries(accounts: Account[]): PrewarmedAccount[] {
+  return accounts.map((account) => ({
+    account,
+    context: null,
+    page: null,
+    status: 'failed' as PrewarmStatus,
+    error: 'prewarm did not finish before the round deadline',
+  }));
+}
+
+/**
+ * Prewarm the accounts at `idx` into `entries`, abandoning whatever has not
+ * landed by `deadline`. Results are written per-account as they settle, so a
+ * concurrent reader (the outage timer) sees progress rather than all-or-nothing.
+ *
+ * Late arrivals are DROPPED, not merged: once the round is sealed the dispatch
+ * plan may already be built from `entries`, and swapping a live page in behind
+ * it would race the tick. Their contexts are closed detached so nothing leaks.
+ *
+ * Returns true when every account settled inside the budget.
+ */
+async function prewarmRound(
+  browser: Browser,
+  entries: PrewarmedAccount[],
+  priorities: string[][],
+  idx: number[],
+  deadline: number
+): Promise<boolean> {
+  let sealed = false;
+  let settled = 0;
+  const tasks = idx.map((i) =>
+    prewarmOne(browser, entries[i].account, priorities[i]).then((r) => {
+      if (sealed) {
+        const late = r.context;
+        if (late) {
+          void closeWithTiming(`late prewarm ctx ${r.account.username}`, () => late.close());
+        }
+        return;
+      }
+      entries[i] = r;
+      settled += 1;
+    })
+  );
+  const complete = await Promise.race([
+    Promise.all(tasks).then(() => true),
+    sleep(Math.max(0, deadline - Date.now())).then(() => false),
+  ]);
+  sealed = true;
+  if (!complete) {
+    console.warn(
+      `[bookingEngine] prewarm round CUT at deadline — ${settled}/${idx.length} settled, ` +
+        `${idx.length - settled} left failed for the standard path`
+    );
+  }
+  return complete;
 }
 
 /**
@@ -265,6 +375,37 @@ async function sendPrewarmHeadsUp(stuck: { username: string; slot: string }[]): 
   } finally {
     clearTimeout(t);
   }
+}
+
+/**
+ * DM the owner the moment prewarm fails for EVERY account.
+ *
+ * Distinct from sendPrewarmHeadsUp: that one reports contested slots from
+ * pre-reset data and changes nothing. This one means no account reached the
+ * site at all — the run is in danger, and the owner still has the retry
+ * window (~4.5 min) to react. Never awaited by the engine.
+ */
+async function sendPrewarmOutageAlert(
+  entries: PrewarmedAccount[],
+  targetTime: Date
+): Promise<void> {
+  const owner = getOwner();
+  if (!owner) return;
+
+  const n = entries.length;
+  const sample = entries.find((e) => e.error)?.error ?? 'no error recorded';
+  const retryUntil = new Date(targetTime.getTime() - RETRY_STOP_BEFORE_MS);
+  const hhmm = (d: Date): string =>
+    d.toLocaleTimeString('en-GB', { hour12: false, timeZone: 'Asia/Bangkok' });
+
+  const text =
+    `🚨 Prewarm ล้มทั้งหมด (${n}/${n} account)\n\n` +
+    `เข้าเว็บไม่ได้เลยสักบัญชี — เป็นปัญหาเน็ต/เว็บล่ม ไม่ใช่ปัญหารายบัญชี\n` +
+    `error: ${sample}\n\n` +
+    `bot จะ retry ทุก ${RETRY_INTERVAL_MS / 1000} วิ จนถึง ${hhmm(retryUntil)} น.\n` +
+    `ถ้าไม่ฟื้นทัน dispatch จะถูก skip อัตโนมัติ (drift guard ${DRIFT_SKIP_MS / 1000} วิ)`;
+
+  await sendTelegramMessage(owner.chat_id, text);
 }
 
 /** Detached teardown with per-step timing. Never awaited by callers. */
@@ -330,6 +471,7 @@ export async function runPrewarmedBatch(
   const start = Date.now();
   const browser = await chromium.launch({ channel: 'chrome', headless: true });
   let entries: PrewarmedAccount[] = [];
+  let outageTimer: NodeJS.Timeout | undefined;
   try {
     // Phase 0: sleep until the prewarm window opens.
     const prewarmFireAt = targetTime.getTime() - prewarmLeadMs();
@@ -345,8 +487,43 @@ export async function runPrewarmedBatch(
     const rotations = computeSlotRotations(accounts);
     const priorities = rotations.map((k) => rotateCourts(COURTS, k));
 
-    // Phase 1: prewarm all accounts in parallel.
-    entries = await Promise.all(accounts.map((a, i) => prewarmOne(browser, a, priorities[i])));
+    // Entries exist before any prewarm runs so the outage timer below reads
+    // real partial state even while Phase 1 is still in flight.
+    entries = pendingEntries(accounts);
+
+    // Phase 0b: arm the total-outage DM on the wall clock. EVERY account
+    // failing at once is an infrastructure signal (site down, network down)
+    // rather than per-account trouble, and it is actionable only while the
+    // retry window is still open. Previously this check ran after Phase 1 —
+    // which meant that on 2026-08-31, the one run that needed it, it fired at
+    // 12:05 alongside the results instead of at 11:56 with 4 minutes still on
+    // the clock. A timer does not care whether Phase 1 came back.
+    const alertAt = targetTime.getTime() - OUTAGE_ALERT_BEFORE_MS;
+    if (!opts.suppressAlerts && alertAt > Date.now()) {
+      outageTimer = setTimeout(() => {
+        if (entries.length > 0 && entries.every((e) => e.status === 'failed')) {
+          console.warn(
+            `[bookingEngine] total outage at T-${OUTAGE_ALERT_BEFORE_MS / 1000}s ` +
+              `(${entries.length}/${entries.length} failed) — DMing owner`
+          );
+          void sendPrewarmOutageAlert(entries, targetTime).catch((err) =>
+            console.error(`[bookingEngine] outage DM failed: ${err}`)
+          );
+        }
+      }, alertAt - Date.now());
+      outageTimer.unref?.();
+    }
+
+    // Phase 1: prewarm all accounts in parallel, bounded by the round budget
+    // so a stalled site cannot eat the retry window (or noon itself).
+    const retryDeadline = targetTime.getTime() - RETRY_STOP_BEFORE_MS;
+    await prewarmRound(
+      browser,
+      entries,
+      priorities,
+      accounts.map((_, i) => i),
+      roundDeadline(retryDeadline)
+    );
     console.log(`[bookingEngine] prewarm: ${tallies(entries)}`);
     for (const e of entries) {
       if (e.status !== 'page-ready') {
@@ -357,7 +534,6 @@ export async function runPrewarmedBatch(
     // Phase 1b: retry transient failures until T-RETRY_STOP_BEFORE_MS.
     // Only 'failed' retries — login-ready/needs-standard are deterministic
     // states, not errors (retrying them re-does work for the same answer).
-    const retryDeadline = targetTime.getTime() - RETRY_STOP_BEFORE_MS;
     while (entries.some((e) => e.status === 'failed') && Date.now() < retryDeadline) {
       const wait = Math.min(RETRY_INTERVAL_MS, retryDeadline - Date.now());
       if (wait <= 0) break;
@@ -367,12 +543,7 @@ export async function runPrewarmedBatch(
         .map((e, i) => (e.status === 'failed' ? i : -1))
         .filter((i) => i >= 0);
       console.log(`[bookingEngine] prewarm retry for ${failedIdx.length} failed account(s)`);
-      const retried = await Promise.all(
-        failedIdx.map((i) => prewarmOne(browser, entries[i].account, priorities[i]))
-      );
-      retried.forEach((r, k) => {
-        entries[failedIdx[k]] = r;
-      });
+      await prewarmRound(browser, entries, priorities, failedIdx, roundDeadline(retryDeadline));
       console.log(`[bookingEngine] prewarm after retry: ${tallies(entries)}`);
     }
 
@@ -505,6 +676,7 @@ export async function runPrewarmedBatch(
 
     return { results, mode: 'prewarm', total_ms: Date.now() - start };
   } finally {
+    if (outageTimer) clearTimeout(outageTimer);
     // Detached teardown — results/DMs never wait on Chrome shutdown.
     void cleanupBatch(entries, browser).catch((err) =>
       console.warn(`[bookingEngine] detached cleanup error: ${err}`)

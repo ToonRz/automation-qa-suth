@@ -267,6 +267,7 @@ async function waitForSlotDropdown(page: Page, timeout = 10000): Promise<void> {
         const sel = document.querySelector('#time') as HTMLSelectElement | null;
         return sel !== null && sel.options.length > 0 && sel.options[0].value !== '';
       },
+      undefined, // arg slot — options must be param 3, else the 30s default applies
       { timeout }
     ),
   ]).catch(() => {
@@ -288,7 +289,7 @@ export async function getBadmintonCourts(page: Page): Promise<CourtInfo[]> {
     return Array.from(sel.options)
       .map((o) => ({ label: (o.textContent ?? '').trim(), value: o.value }))
       .filter((o) => o.label.includes('แบดมินตัน') && !o.label.includes('เทนนิส'));
-  }, { timeout: 8_000 });
+  }, undefined, { timeout: 8_000 }); // arg slot — options must be param 3, else the 30s default applies
 }
 
 /**
@@ -820,6 +821,7 @@ async function attemptSubmitBooking(
         const sel = document.querySelector('#time') as HTMLSelectElement | null;
         return sel !== null && sel.options.length > 0 && sel.options[0].value !== '';
       },
+      undefined, // arg slot — options must be param 3, else the 30s default applies
       { timeout: 3000 }
     ),
   ]).catch(() => null);
