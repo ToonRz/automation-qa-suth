@@ -1,0 +1,165 @@
+# Handoff สำหรับ agent บนเครื่องที่ 2 (machine-2) — 2026-09-27
+
+> อ่านทั้งไฟล์ก่อนลงมือ. กฎของ repo (CLAUDE.md): **ทุกการแก้ต้องอิง `requirements.md` —
+> อะไรที่นอกเหนือ spec (tooling ใหม่, dependency ใหม่, behavior ใหม่) ให้ถาม user ก่อน.**
+> ห้ามพิมพ์ token/password เต็มลงแชท, log, commit หรือไฟล์ใดๆ ใน repo (repo เป็น PUBLIC).
+
+## บริบท
+
+- Repo: `ToonRz/automation-qa-suth` (**public**). เครื่องนี้รันบอท Telegram `David_Bot`
+  (bot id `8567202370`) จอง 19 บัญชีตอน 12:00:00.
+- เครื่องนี้เพิ่ง merge 5 commits จาก `origin/main` วันนี้ (27/09) รวม `763f8db`
+  (bound prewarm rounds) และ `95a5c02` (reload users.json). ก่อนหน้านั้น (รวมรอบเที่ยง 26/09)
+  **รันโค้ดเก่าที่ไม่มี fix เหล่านี้**.
+- ตอน merge ใช้ `-X ours` แล้วต้องเอาเวอร์ชัน main ทั้งไฟล์สำหรับ `src/server/bookingEngine.ts`
+  และ `src/server/bot.ts` — ข้อมูลเฉพาะเครื่องอยู่ใน `config/users.json` (gitignored).
+
+---
+
+## ขั้นที่ 0 — อัปเดตเป็น `main` ล่าสุดก่อนแก้อะไรทั้งนั้น
+
+ทุกการ diagnose/แก้ในไฟล์นี้ต้องทำบนโค้ด `origin/main` ล่าสุด (อย่างน้อยต้องมี `2016eca`).
+
+```bash
+git status --short                 # ต้องว่าง; ถ้ามีไฟล์ค้าง → หยุด แจ้ง user ก่อน (อย่า stash/ทิ้งเอง)
+git switch main
+git fetch origin
+git log --oneline HEAD..origin/main    # สิ่งที่จะได้มาใหม่
+git log --oneline origin/main..HEAD    # commit ของเครื่องนี้ที่ยังไม่ได้ push
+```
+
+จากนั้นเช็กว่า history ถูก rewrite หรือยัง (รายละเอียดดูปัญหา 3):
+
+```bash
+git log origin/main --oneline -- .env.bak-predeep.20260701-150459 | head
+```
+
+- **มีผลลัพธ์ (ยังไม่ rewrite):**
+  ```bash
+  git pull --ff-only origin main
+  ```
+  ถ้า `--ff-only` ไม่ผ่าน (เครื่องนี้มี commit ที่ยังไม่ push) → หยุด แสดง `git log origin/main..HEAD`
+  ให้ user ดู แล้วขอความเห็นก่อน merge/rebase. **อย่าใช้ `-X ours`/`-X theirs` เอง.**
+- **ว่าง (rewrite แล้ว):** ห้าม `git pull` — ทำตามปัญหา 3 ข้อ 1 (สำรอง branch → ขอ user ยืนยัน →
+  `git reset --hard origin/main` → cherry-pick commit ของเครื่องนี้กลับ).
+
+หลังอัปเดตแล้ว:
+
+```bash
+git log --oneline -1                                   # ควรเป็น origin/main ล่าสุด
+git merge-base --is-ancestor 2016eca HEAD && echo ok   # มี commit untrack ไฟล์ลับแล้ว
+npm install
+npx tsc --noEmit                                       # ต้องผ่านก่อนไปต่อ
+```
+
+ถ้าบอทรันอยู่ ต้องรีสตาร์ทบอทให้ใช้โค้ดใหม่ — **ห้ามรีสตาร์ทช่วง 11:50–12:15** (จะกระทบรอบเที่ยง);
+นอกช่วงนั้นให้แจ้ง user ก่อนรีสตาร์ท.
+
+---
+
+## ปัญหา 1 — รอบเที่ยง 26/09 พลาดทั้ง 19 บัญชี (`missed-deadline`)
+
+**อาการ:** DM ผลลัพธ์มาตอน 12:10 ทุกบัญชี
+`missed-deadline: dispatch started 602168ms past fire time` → `PASS 0 | FAIL 19 | ERROR 0`.
+
+**ความหมาย:** drift guard (`DRIFT_SKIP_MS = 30_000` ใน `src/server/bookingEngine.ts`)
+เห็นว่าถึงจุด dispatch ช้าไป ~10 นาที จึงข้ามการยิงทั้งหมด. guard ทำงานถูก — ปัญหาอยู่ที่ว่า
+**อะไรกินเวลา 10 นาทีก่อนเที่ยง**.
+
+**สมมติฐาน (ยังไม่ยืนยัน — ต้องดูหลักฐานในเครื่องนี้):**
+
+1. **เน็ตขาออกของเครื่องนี้ตาย/สะดุดช่วง prewarm (11:55–12:00)** + โค้ดเก่าที่ Phase 1 ไม่มี
+   deadline รวม. เคยเกิดบนเครื่องที่ 1 เมื่อ 31/08: goto ทุกบัญชี timeout 20s แล้วการปิด context
+   ที่ตายไล่เป็นระลอกบน CDP pipe เดียว ทำให้ Phase 1 ยาว 10m11s. ตัวเลข 602s ตรงกับ pattern นี้มาก.
+   `763f8db` แก้แล้ว (แต่ละรอบ race deadline 50% ของเวลาที่เหลือ, outage DM ตั้งตาม wall clock ที่ T-4m,
+   close ของ context ที่ error เป็น detached).
+2. **MacBook sleep** ช่วง 11:55–12:10 → timer หยุด, เน็ตหลุด, ตื่นมาเลยเวลา. repo **ไม่มี**
+   `caffeinate`/`pmset` ใดๆ.
+3. (เครื่องที่ 1 เคยเจอ) firewall ที่ user ทดสอบอยู่ใน LAN ทิ้ง HTTPS ขาออกแบบเงียบๆ —
+   ถาม user ว่าเครื่องนี้อยู่ LAN เดียวกันหรือไม่.
+
+**ขั้นตอน diagnose (ทำตามลำดับ, รายงานผลให้ user ก่อนแก้):**
+
+```bash
+# (a) เครื่อง sleep ช่วงนั้นไหม
+pmset -g log | grep -E "2026-09-26 1[12]:" | grep -iE "sleep|wake|DarkWake"
+```
+
+```bash
+# (b) log ของบอท (default: bot.log ที่ root repo หรือ $BOT_LOG_PATH) ช่วงรอบ 26/09
+grep -nE "prewarm|dispatch SKIPPED|total outage|timeout|Timeout|cleanup" bot.log | grep "2026-09-26T0[45]" | head -80
+```
+
+การตีความ:
+- มี Sleep/Wake ในช่วงนั้น → สาเหตุ 2.
+- ไม่ sleep แต่เต็มไปด้วย goto/navigation timeout ของทุกบัญชีพร้อมกัน และ Telegram fetch error
+  ในช่วงเดียวกัน → เน็ตขาออก (สาเหตุ 1/3) ไม่ใช่บั๊ก Playwright. **อย่าไปจูน timeout ในโค้ดก่อน.**
+- `[bookingEngine] prewarm: …` บรรทัดสรุปมาตอนหลัง ~11:59 → Phase 1 กินหน้าต่างเวลา (โค้ดเก่า).
+- log ของโค้ดใหม่ที่ควรเห็นในรอบถัดไป: `prewarm retry for N failed account(s)` (ถ้ามีบัญชีพัง) และ
+  `total outage at T-240s` (ถ้าพังทั้งหมด). **ถ้ารอบถัดไปพังแล้วไม่มี `prewarm retry for` เลย = หน้าต่างเวลาถูกกินอีก.**
+
+**การแก้ที่เสนอ (ถาม user ก่อนทุกข้อ — เป็น behavior/tooling ใหม่นอก spec):**
+- ถ้าเป็น sleep: รันบอทใต้ `caffeinate -is` หรือให้ user ตั้ง Energy settings ไม่ให้ sleep ตอนเสียบไฟ.
+  ห้ามแก้ system/security settings เอง — บอกให้ user ทำ.
+- ถ้าเป็นเน็ต: แก้ที่เครือข่าย ไม่ใช่โค้ด. ก่อน 11:55 ทุกวันทดสอบได้ด้วย
+  `curl -sS -o /dev/null -w "%{http_code} %{time_total}s\n" https://susport.sc.su.ac.th/login.php`
+  (หมายเหตุ: probe ครั้งเดียวผ่าน ไม่รับประกันว่าหลาย connection พร้อมกันจะผ่าน).
+- ยืนยันว่าเครื่องนี้มี `763f8db` จริง: `git merge-base --is-ancestor 763f8db HEAD && echo ok`.
+
+---
+
+## ปัญหา 2 — วันนี้ 11:36 `/start` แล้วได้ `⚠️ bot reply failed (bot)` reason ว่าง
+
+**อาการ:** `FetchError: request to https://api.telegram.org/bot8567202370:[REDACTED]/sendMessage failed, reason:`
+ตามด้วยแค่ timestamp `2026-09-27T04:39:32.376Z` (บรรทัดที่ `alertOwnerAboutReplyFail` ใน
+`src/server/bot.ts` ต่อท้าย) — ไม่ใช่เหตุผล. alert มาถึง 11:39 = ~3 นาทีหลัง `/start`.
+
+**ความหมาย:** บอท*รับ* update ได้ แต่ `sendMessage` เชื่อมต่อไม่ติด. reason ว่างมักเป็น
+connect timeout แบบ `AggregateError` (IPv4/IPv6 ล้มหมด) ที่ message ว่าง. = หลักฐานอีกชิ้นว่า
+**เน็ตขาออกของเครื่องนี้สะดุดเป็นช่วงๆ** (session ก่อนก็เจอ: test message รอบแรก fetch timeout
+รอบสองผ่าน). ใช้ร่วมกับปัญหา 1 ในการ diagnose.
+
+**เสนอ (ถาม user ก่อน):** ให้ `alertOwnerAboutReplyFail` แสดง `err.cause?.code` /
+`err.errors?.map(e => e.code)` ด้วย จะได้เห็น `ETIMEDOUT`/`ENETUNREACH` แทน reason ว่าง.
+เป็นการแก้เล็กในการรายงานเท่านั้น แต่ยังถือว่าเป็น change ที่ต้องขออนุญาตตามกฎ repo.
+
+---
+
+## ปัญหา 3 — token รั่วใน repo public (เกี่ยวกับ git ของเครื่องนี้)
+
+- token ที่รั่วคือของ **เครื่องที่ 1** (bot id `8912911313`, @AutocourtSU_bot) — **ไม่ใช่** token
+  ของเครื่องนี้ (`8567202370`). เครื่องนี้ไม่ต้อง revoke อะไร (เท่าที่รู้).
+- ไฟล์ที่รั่ว: `.env.bak-predeep.20260701-150459` (token เต็ม) และ
+  `bot.log.2026-06-30-pre-restart.bak` (prefix). ถูก untrack แล้วใน `2016eca` บน `origin/main`
+  พร้อมกฎ `.gitignore` ใหม่: `.env.*`, `!.env.example`, `*.bak`.
+- **ยังไม่ได้ rewrite history** — ไฟล์ยังอยู่ใน commit เก่า (ตั้งแต่ `59eb603`/`067d56f`).
+  เครื่องที่ 1 **อาจ** รัน `git filter-branch` + `git push --force` กับ `main`, `Testnewlogic1`,
+  `testnewlogic1`, `deploy/machine-2`, `feat/prioritize-21-22`, `feat/verify-21-22-fallback` ภายหลัง.
+
+**สิ่งที่ agent บนเครื่องนี้ต้องทำ:**
+
+1. `git fetch origin` แล้วเช็กว่า history ถูก rewrite แล้วหรือยัง:
+   ```bash
+   git log origin/main --oneline -- .env.bak-predeep.20260701-150459 | head
+   ```
+   - มีผลลัพธ์ = ยังไม่ rewrite → `git pull` ปกติได้ (จะได้ `2016eca`).
+   - ว่าง = rewrite แล้ว → **ห้าม `git pull`/`git push` ตรงๆ** (จะเอา history เก่ากลับขึ้นไป).
+     ให้เช็ก commit ที่ยังไม่ได้ push ก่อน (`git log origin/main..HEAD` เทียบด้วย subject/diff เพราะ SHA
+     เปลี่ยน), เก็บไว้ด้วย branch สำรอง, แล้ว `git reset --hard origin/main` และ cherry-pick
+     commit ของเครื่องนี้กลับมา. **ขอ user ยืนยันก่อน reset --hard.**
+2. **อย่า push ขึ้น origin จนกว่าจะทำข้อ 1** (session ก่อนมีคำสั่ง "push ขึ้น origin" ค้างอยู่).
+3. เช็กว่าเครื่องนี้ไม่มีไฟล์ลับถูก track:
+   ```bash
+   git ls-files | grep -E '\.env|\.bak|\.log$|users\.json|accounts\.json'
+   ```
+   ควรเห็นแค่ `.env.example`. ถ้ามีอย่างอื่น → `git rm --cached` + แจ้ง user ทันที (อย่า paste เนื้อหา).
+4. ห้าม commit ไฟล์ backup ของ `.env` หรือ log อีก.
+
+---
+
+## ลำดับความสำคัญ
+
+1. ขั้นที่ 0 — อัปเดตเป็น `main` ล่าสุด (รวมการเช็ก rewrite ของปัญหา 3 ข้อ 1–2) ก่อนทำอย่างอื่น.
+2. ปัญหา 1 diagnose (a)/(b) → รายงาน user → ขออนุมัติการแก้.
+3. ปัญหา 2 (เสนอเท่านั้น).
+4. ก่อนรอบเที่ยงถัดไป: บอทรันอยู่บนโค้ดที่มี `763f8db`, เครื่องไม่ sleep, `curl` ไป susport ผ่าน.
