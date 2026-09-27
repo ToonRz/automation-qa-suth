@@ -17,6 +17,9 @@ screenshots/
 .env
 .env.local
 .env.*.local
+.env.*
+!.env.example
+*.bak
 accounts.local.json
 config/accounts.json
 config/users.json
