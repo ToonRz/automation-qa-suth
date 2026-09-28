@@ -272,4 +272,62 @@ async function waitUntilNoonThenRun(): Promise<void> {
 - `src/server/bot.ts` (prewarm notice) — group display ตาม slot ไม่ใช่ per-account court
 - `src/server/{testWizardHelpers,testPrewarmNotice,sendDryRunMessages}.ts` — test mirrors + assertions sync กับ production
 
+### 10.5 Phase-3 time bounds (log audit 2026-09-28, งาน A)
 
+**ปัญหา**: 11 และ 15 ก.ย. prewarm ล้มหมด แล้ว Chrome ค้างระหว่าง Phase 3 — `Promise.all` ไม่มีเพดาน, `fetch()` ใน `page.evaluate` และ `browser.newContext()` ไม่มี timeout → DM ผลออก 12:12 และ 12:51.
+
+**Fix** (user-approved Q-A1/Q-A2):
+- in-page fetch ใช้ `AbortController`: booking POST 15s, `get_reserved_times.php` 8s/สนาม, `reservations.php` 8s. POST ที่ถูก abort ยังผ่าน `confirmViaReservationsIfUnclear` ก่อนลองสนามถัดไป (กันจองซ้ำ)
+- `browser.newContext()` ใน standard path race 20s; context ที่มาช้าถูกปิดทันทีที่มาถึง
+- `ACCOUNT_SETTLE_BUDGET_MS = 90s` ต่อบัญชีใน Phase 3 และ `runStandard`: เกินเพดาน → `status: ERROR`, `fail_reason: "timeout: ไม่จบภายใน 90s — ผลจริงไม่ทราบ ให้เช็ค reservations.php"` และ DM ทันที; งานจริงวิ่งต่อ, ผลจริง log เป็น `[result-late]` และบันทึกลง report (หรือ `bot-run-*.late.json`) — ไม่ส่ง DM ซ้ำ
+- timer ตั้งหลัง submit ทุกบัญชีออกไปแล้วเท่านั้น (ไม่มีงานเพิ่มระหว่าง 12:00:00.000 กับ submit); teardown แบบ detached รอให้งานที่วิ่งต่อจบก่อนปิด browser
+
+**Acceptance delta**: ไม่มีบัญชีไหนรอผลเกิน 90s หลัง dispatch; run ปกติ (จบ ≤ 8s) ไม่เปลี่ยน.
+
+**ไฟล์**: `src/bookingFlow.ts`, `src/server/bookingEngine.ts`, `src/server/bot.ts`
+
+### 10.6 Cancel cut prewarm rounds + fresh browser after total outage (งาน B)
+
+**ปัญหา**: 15 ก.ย. prewarm round ที่ถูก CUT แค่ทิ้งผล — context ค้าง 51 ตัว (+ standard 17) ใน Chrome ตัวเดียวกับที่ Phase 3 ต้องใช้, ปิดเสร็จหลัง 18 นาที.
+
+**Fix** (user-approved Q-B1):
+- ตอน round ถูก seal → context ของบัญชีที่ยังไม่ settle ถูก `closeWithTiming` ทันที (ครั้งเดียว) ก่อนเริ่ม retry รอบใหม่; context ที่ `newContext()` ยังค้างอยู่ถูกปิดทันทีที่มาถึง
+- หลัง retry window (T-40s) ถ้าทุกบัญชี `failed` → launch browser ใหม่ให้ Phase 3 (race 20s และไม่เลยเวลายิง); ไม่ทัน/ล้ม → ใช้ตัวเดิม + `[WARN]`
+- `cleanupBatch` ปิดทุก browser ของรอบนั้น
+
+**ไฟล์**: `src/server/bookingEngine.ts`
+
+### 10.7 Bot-mode §7 report + retention (งาน D)
+
+**ปัญหา**: โหมด bot ไม่เขียน JSON report (§7) เลย ผลรายบัญชีมีแค่ใน DM และ `<username>.png` ถูกทับทุกวัน.
+
+**Fix** (user-approved Q-D1):
+- เขียน `reports/bot-run-<fire ISO>.json` ทุก exit path (ปกติ / drift-guard SKIPPED / batch throw) — field §7 ครบทุกบัญชี + `fire_time`, `fired_at`, `drift_ms`, `mode`, `prewarm` tallies, `total_ms`, `counts`; เขียนไม่ได้ → `console.warn` ไม่ throw
+- log `[result] <username> <status> court=… slot=… <ms>ms reason=…` ต่อบัญชี
+- screenshot เก็บที่ `screenshots/<YYYY-MM-DD>/<username>.png` (วันตามเวลา Bangkok)
+- เก็บ 30 วัน: ตอนเขียน report ใหม่ ลบเฉพาะ `reports/bot-run-*` และโฟลเดอร์วันที่ใน `screenshots/` ที่เก่ากว่า 30 วัน
+
+**ไฟล์**: `src/server/runReport.ts` (NEW), `src/server/bookingEngine.ts`, `src/server/bot.ts`, `src/server/rehearse.ts`
+
+### 10.8 Missed-noon watchdog (งาน E)
+
+**ปัญหา**: ก.ย. 2026 ไม่ได้ยิง 6 วันโดยไม่มีใครรู้ — Mac หลับตอน 11:55 และ `node-cron` ไม่ยิงย้อนหลังเมื่อเครื่องตื่น.
+
+**Fix** (user-approved Q-E1):
+- `config/run-state.json` (gitignored): `last_cron_fired_date`, `last_dispatch_date`, `missed_alert_date` (วันตาม Bangkok) — dispatch นับทั้ง FIRE และ SKIPPED
+- watchdog ตอน start และทุก 60s: ตั้งแต่ 12:05 ถ้ามี user ที่เปิด cron และมีบัญชี แต่วันนี้ยังไม่ dispatch → DM owner `⚠️ พลาดรอบ 12:00 วันนี้ …` วันละครั้ง. **ไม่จองย้อนหลัง** (SC-04)
+- การกันเครื่องหลับ (เสียบไฟ / ไม่ปิดฝา / `pmset`) เป็นหน้าที่ของ user — ไม่ทำในโค้ด
+
+**ไฟล์**: `src/server/runState.ts` (NEW), `src/server/bookingEngine.ts` (`onDispatched`), `src/server/bot.ts`
+
+### 10.9 Startup + log retention (งาน F)
+
+**ปัญหา**: `getMe` ล้ม → `process.exit(1)` → launchd restart วน (1, 16 ก.ย.); ถ้าเน็ต/DNS ล่มตอน 11:55 cron จะไม่ถูกตั้ง. `bot.log` ถูกล้างทุก restart.
+
+**Fix** (user-approved Q-F):
+- ตั้ง cron + watchdog ก่อน โดยไม่ขึ้นกับ Telegram; `getMe` retry backoff 5s, 10s, 30s แล้วทุก 60s ไม่ exit; long-poll เริ่มหลัง `getMe` ผ่าน
+- `bot.log` append ข้าม restart, rotate เป็น `bot.log.1` เมื่อเกิน 5MB (เก็บ 1 ไฟล์)
+
+**ไฟล์**: `src/server/botLog.ts` (NEW), `src/server/bot.ts`
+
+**ทดสอบ (10.5–10.9)**: `npm run test:log-audit` — mock server (`node:http`) + Chrome จริง, ไม่แตะเว็บจริงและ Telegram

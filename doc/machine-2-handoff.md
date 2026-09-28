@@ -4,6 +4,31 @@
 > อะไรที่นอกเหนือ spec (tooling ใหม่, dependency ใหม่, behavior ใหม่) ให้ถาม user ก่อน.**
 > ห้ามพิมพ์ token/password เต็มลงแชท, log, commit หรือไฟล์ใดๆ ใน repo (repo เป็น PUBLIC).
 
+## อัปเดต 2026-09-28 — ต้อง pull ชุด fix จาก log audit
+
+ชุดนี้อยู่บน branch `fix/log-audit-2026-09-28` (spec: `doc/fix-plan-2026-09-28-log-audit.md`,
+บันทึกใน `requirements.md` §10.5–10.9). **รอ user merge เข้า `main` แล้ว push ก่อน** จากนั้นทำตาม
+"ขั้นที่ 0" ด้านล่าง (`git pull --ff-only origin main` → `npx tsc --noEmit`; ไม่มี dependency ใหม่).
+
+Commit ในชุด:
+- `fix(engine): arm outage alert before browser launch` (C)
+- `feat(bot): write §7 JSON report and per-account result log` (D)
+- `fix(engine): bound phase-3 per-account time and in-page fetches` (A)
+- `fix(engine): cancel in-flight prewarm on round cut, fresh browser after total outage` (B)
+- `feat(bot): alert owner when the noon run was missed` (E)
+- `fix(bot): don't exit on startup Telegram failure` (F)
+- `docs: record log-audit fixes in requirements §10 and handoffs` (ปิดงาน)
+
+หลัง pull:
+- restart บอท **นอกช่วง 11:50–12:15** (แจ้ง user ก่อน). ถ้า restart หลัง 12:05 ครั้งแรก จะเห็น
+  `[watchdog] run-state created …` — ปกติ ไม่ใช่ error.
+- ไฟล์ใหม่ที่บอทสร้างเอง (gitignored ทั้งหมด): `config/run-state.json`, `reports/bot-run-*.json`,
+  `screenshots/<YYYY-MM-DD>/`, `bot.log.1`. `bot.log` ไม่ถูกล้างตอน start แล้ว.
+- ตรวจรอบเที่ยงถัดไปใน log: `[perf] browser launch=` 1 บรรทัด, `[result]` ครบทุกบัญชี (19),
+  `[report] wrote … (19 account(s))`, และต้อง**ไม่มี** `did not settle`, `submit timeout`, `result-late`,
+  `round CUT`, `fresh browser` ในรอบปกติ.
+- ทดสอบได้ด้วย `npm run test:log-audit` (~15 นาที; mock server + Chrome จริง ไม่แตะเว็บจริง/Telegram).
+
 ## บริบท
 
 - Repo: `ToonRz/automation-qa-suth` (**public**). เครื่องนี้รันบอท Telegram `David_Bot`

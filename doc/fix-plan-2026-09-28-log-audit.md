@@ -1,6 +1,6 @@
 # Spec + Tasks: แก้ปัญหาจาก log audit 2026-09-28
 
-> สถานะ: **DRAFT รอ user approve** — ยังไม่ได้ implement อะไร
+> สถานะ: **implement แล้วบน branch `fix/log-audit-2026-09-28`** (2026-09-28) — รอ user review / merge / restart bot
 > กฎ repo (CLAUDE.md): ทุกการแก้ต้องอิง `requirements.md` — ข้อไหน "นอก spec" ติดป้ายไว้ในหัวข้อ
 > และต้องได้ approve ก่อนลงมือ. repo เป็น **public** — ห้ามใส่ username / chat id / token ในไฟล์นี้หรือ commit.
 
@@ -214,6 +214,11 @@ Audit `bot.stdout.log` ช่วง 2026-09-01 ถึง 2026-09-28 (โค้�
 | Q-R  | อัปเดต `requirements.md` §10 (Operational Notes) ให้บันทึกข้อ A/B/E/F ที่ approve แล้ว | อัปเดต |
 | Q-M2 | ใช้กับเครื่องที่ 2 (machine-2, 19 บัญชี) ด้วย — merge แล้วแจ้งผ่าน handoff doc | ใช่ |
 
+**คำตอบที่ user approve (2026-09-28):** Q-A1 = 90s · Q-A2 = `ERROR` + fail_reason ให้ไปเช็ค reservations.php ·
+Q-B1 = ทำ (launch race 20s, ไม่ทันใช้ตัวเก่า) · Q-D1 = 30 วัน ลบตอนเขียน report ใหม่ (เฉพาะ `reports/bot-run-*`
+และโฟลเดอร์วันที่ใน `screenshots/`) · Q-E1 = ตั้งแต่ 12:05 Asia/Bangkok วันละครั้ง · Q-F = ทำทั้ง F1, F2 ·
+Q-R = บันทึก A/B/D/E/F ใน §10 · Q-M2 = อัปเดต handoff doc
+
 ---
 
 ## 4. Tasks
@@ -232,7 +237,7 @@ Audit `bot.stdout.log` ช่วง 2026-09-01 ถึง 2026-09-28 (โค้�
 - [x] D-2 เขียน `reports/bot-run-*.json` ใน `runScheduledBooking` ทุก exit path (try/catch, ไม่ throw)
 - [x] D-3 log `[result]` ต่อบัญชีใน `onAccountSettled`
 - [x] D-4 screenshot ลงโฟลเดอร์วันที่ (`baseFlowOptions` → `screenshotsDir/<date>`) + retention ตาม Q-D1
-- [ ] D-5 verify ด้วย `npm run rehearse` (นอกช่วง 11:50–12:05) + กรณี drift skip
+- [x] D-5 verify ด้วย `npm run rehearse` (นอกช่วง 11:50–12:05) + กรณี drift skip
 - [x] D-6 commit `feat(bot): write §7 JSON report and per-account result log`
 
 ### A — Phase 3 bounds
@@ -241,7 +246,7 @@ Audit `bot.stdout.log` ช่วง 2026-09-01 ถึง 2026-09-28 (โค้�
 - [x] A-3 `newContext` race 20s ใน `bookOneAccount` standard path
 - [x] A-4 `withSettleBudget()` ครอบ `bookOneAccount` ใน Phase 3 + `runStandard`; late result → `[result-late]` + `.late.json`
 - [x] A-5 test: mock server ค้าง POST / ค้างทุก request (ตาม acceptance ของ A)
-- [ ] A-6 test: `npm run test:fast-confirm` + rehearse ผลเหมือนเดิม
+- [x] A-6 test: `npm run test:fast-confirm` + rehearse ผลเหมือนเดิม
 - [x] A-7 commit `fix(engine): bound phase-3 per-account time and in-page fetches`
 
 ### B — cancel cut rounds / fresh browser
@@ -264,10 +269,10 @@ Audit `bot.stdout.log` ช่วง 2026-09-01 ถึง 2026-09-28 (โค้�
 - [x] F-3 commit `fix(bot): don't exit on startup Telegram failure`
 
 ### ปิดงาน
-- [ ] อัปเดต `requirements.md` §10 ตาม Q-R
+- [x] อัปเดต `requirements.md` §10 ตาม Q-R
 - [ ] restart bot นอกช่วง 11:50–12:05, ตรวจ noon run วันถัดไป:
       `browser launch=`, `[result]` ครบ, `reports/bot-run-*.json`, ไม่มี timeout บน run ปกติ
-- [ ] แจ้ง machine-2 ให้ pull (อัปเดต `doc/machine-2-handoff.md`)
+- [x] แจ้ง machine-2 ให้ pull (อัปเดต `doc/machine-2-handoff.md`)
 
 ---
 
