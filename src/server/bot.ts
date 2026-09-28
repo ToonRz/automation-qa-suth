@@ -17,7 +17,6 @@ import { Telegraf, Context } from 'telegraf';
 import type { Update } from 'telegraf/typings/core/types/typegram';
 import * as dotenv from 'dotenv';
 import * as cron from 'node-cron';
-import * as fs from 'fs';
 import * as path from 'path';
 import * as dns from 'dns';
 
@@ -52,6 +51,7 @@ import type { EngineResult } from './bookingEngine';
 import type { BookingResult } from '../bookingFlow';
 import { createRunReporter, formatResultLine } from './runReport';
 import { checkMissedNoon, recordCronFired, recordDispatch } from './runState';
+import { openAppendLog } from './botLog';
 import { waitUntilLocalTimestamp } from '../localClock';
 import { sendTelegramMessage } from './telegramSend';
 
@@ -61,20 +61,13 @@ dotenv.config();
 // which hides the "Bot started" line and any handler errors. The file
 // flushes synchronously so we can always see what the bot is doing.
 const LOG_PATH = process.env.BOT_LOG_PATH ?? path.resolve(__dirname, '..', '..', 'bot.log');
-// Truncate previous run's log on start
-try {
-  fs.writeFileSync(LOG_PATH, '');
-} catch {
-  /* ignore */
-}
+// Appended across restarts — a crash-loop must not erase its own evidence —
+// and rotated to bot.log.1 past 5MB (see botLog.ts).
+const appendLog = openAppendLog(LOG_PATH);
 function logToFile(line: string): void {
   const stamped = `[${new Date().toISOString()}] ${line}\n`;
   process.stdout.write(stamped);
-  try {
-    fs.appendFileSync(LOG_PATH, stamped);
-  } catch {
-    /* ignore log write errors */
-  }
+  appendLog(stamped);
 }
 // Redirect all console.* through our logger so we don't miss anything.
 console.log = (...args) => logToFile(args.map(String).join(' '));
@@ -1572,15 +1565,10 @@ async function main() {
   console.log(`Telegram token: ${TOKEN!.slice(0, 10)}...`);
   console.log(`Registered users: ${getAllUsers().length}`);
 
-  // Eager reachability check — fail fast with a useful message if the bot
-  // can't talk to Telegram from this host (e.g. IPv6-only paths blocked).
-  try {
-    const me = await bot.telegram.getMe();
-    console.log(`✓ Telegram reachable as @${me.username} (id=${me.id})`);
-  } catch (err) {
-    console.error('✗ Telegram getMe failed (network? IPv6 vs IPv4?):', err);
-    process.exit(1);
-  }
+  // The noon cron and the missed-run watchdog come FIRST and do not depend on
+  // Telegram — booking never needs it. A failed getMe used to exit(1) right
+  // here: launchd then restarted the bot in a loop (2026-09-01, 09-16), and a
+  // network/DNS blip at 11:55 would have meant no cron that day at all.
 
   // Schedule noon trigger (local time, every day).
   // node-cron uses local time by default. We want 12:00 local — set
@@ -1615,6 +1603,38 @@ async function main() {
   process.once('SIGINT', onSignal('SIGINT'));
   process.once('SIGTERM', onSignal('SIGTERM'));
 
+  void connectTelegramThenPoll();
+
+  // Keep the process alive.
+  await new Promise<void>(() => {
+    /* never resolves — runs until SIGINT/SIGTERM */
+  });
+}
+
+/** getMe retry schedule: 5s, 10s, 30s, then every 60s until it answers. */
+const GETME_RETRY_DELAYS_MS = [5_000, 10_000, 30_000, 60_000];
+
+/** Eager reachability check (a useful log line when this host can't reach
+ *  Telegram, e.g. IPv6-only paths blocked), retried with backoff instead of
+ *  exiting, then the long-poll loop. Cron is already scheduled by now. */
+async function connectTelegramThenPoll(): Promise<void> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const me = await bot.telegram.getMe();
+      console.log(`✓ Telegram reachable as @${me.username} (id=${me.id})`);
+      break;
+    } catch (err) {
+      const delay =
+        GETME_RETRY_DELAYS_MS[Math.min(attempt - 1, GETME_RETRY_DELAYS_MS.length - 1)];
+      console.error(
+        `✗ Telegram getMe failed (attempt ${attempt}, retrying in ${delay / 1000}s — ` +
+          `network? IPv6 vs IPv4?):`,
+        err
+      );
+      await new Promise<void>((resolve) => setTimeout(resolve, delay));
+    }
+  }
+
   // bot.launch() in telegraf 4.x hangs on long-poll (we observed: it opens
   // a polling socket that monopolises the http.Agent, so even outbound
   // sendMessage calls queue behind it for 30+ seconds, and after the first
@@ -1623,11 +1643,6 @@ async function main() {
   // bot.handleUpdate() ourselves via raw fetch.
   console.log('Starting bot (custom long-poll loop)...');
   startPollingLoop().catch((err) => console.error('[poll] fatal:', err));
-
-  // Keep the process alive.
-  await new Promise<void>(() => {
-    /* never resolves — runs until SIGINT/SIGTERM */
-  });
 }
 
 /** Custom long-polling loop using fetch.

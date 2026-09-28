@@ -40,6 +40,7 @@ const userStore = require('./userStore') as typeof import('./userStore');
 const engine = require('./bookingEngine') as typeof import('./bookingEngine');
 const runReport = require('./runReport') as typeof import('./runReport');
 let runState = require('./runState') as typeof import('./runState');
+const botLog = require('./botLog') as typeof import('./botLog');
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const SITE = 'https://susport.sc.su.ac.th';
@@ -962,6 +963,54 @@ const scenarios: Scenario[] = [
       const before = sent.length;
       assert.equal(await check('12:06'), false, 'dispatched today → no alert');
       assert.equal(sent.length, before);
+    },
+  },  {
+    name: 'f-log',
+    about: 'F2: bot.log is appended across restarts and rotated to .1 past the size cap (one .1 kept)',
+    run: async () => {
+      const file = path.join(TMP, 'bot.log');
+      fs.rmSync(file, { force: true });
+      fs.rmSync(`${file}.1`, { force: true });
+      let write = botLog.openAppendLog(file, 100);
+      write('run1-a\n');
+      write('run1-b\n');
+      write = botLog.openAppendLog(file, 100); // restart
+      write('run2-a\n');
+      write = botLog.openAppendLog(file, 100); // restart again
+      write('run3-a\n');
+      assert.equal(fs.readFileSync(file, 'utf-8'), 'run1-a\nrun1-b\nrun2-a\nrun3-a\n', 'earlier runs kept');
+
+      write('x'.repeat(80) + '\n'); // crosses the 100-byte cap
+      write('after-rotate\n');
+      assert.match(fs.readFileSync(`${file}.1`, 'utf-8'), /^run1-a\n[\s\S]*x{80}\n$/, 'old log moved to .1');
+      assert.equal(fs.readFileSync(file, 'utf-8'), 'after-rotate\n');
+      write('y'.repeat(100) + '\n');
+      write('second-rotate\n');
+      assert.match(fs.readFileSync(`${file}.1`, 'utf-8'), /^after-rotate\ny{100}\n$/, 'only one .1 is kept');
+      assert.equal(botLog.BOT_LOG_MAX_BYTES, 5 * 1024 * 1024, 'production cap is 5MB');
+    },
+  },
+  {
+    name: 'f-startup',
+    about: 'F1 (source-level, bot.ts cannot run next to the live bot): cron + watchdog before getMe, getMe retried with 5/10/30/60s backoff, no exit',
+    run: async () => {
+      const src = fs.readFileSync(path.join(__dirname, 'bot.ts'), 'utf-8');
+      const main = src.slice(src.indexOf('async function main()'), src.indexOf('/** getMe retry schedule'));
+      assert.ok(main.length > 0, 'main() found');
+      assert.ok(!/process\.exit\(1\)/.test(main), 'main() never exits on a Telegram failure');
+      assert.ok(!/bot\.telegram\.getMe/.test(main), 'main() does not wait for getMe');
+      const cronAt = main.indexOf("cron.schedule('55 11 * * *'");
+      const watchdogAt = main.indexOf('startMissedRunWatchdog()');
+      const telegramAt = main.indexOf('void connectTelegramThenPoll()');
+      assert.ok(cronAt >= 0 && watchdogAt > cronAt && telegramAt > watchdogAt, 'cron → watchdog → Telegram');
+      const connect = src.slice(
+        src.indexOf('async function connectTelegramThenPoll()'),
+        src.indexOf('/** Custom long-polling loop')
+      );
+      assert.ok(/GETME_RETRY_DELAYS_MS\[/.test(connect) && !/process\.exit/.test(connect), 'getMe retries, never exits');
+      assert.ok(/const GETME_RETRY_DELAYS_MS = \[5_000, 10_000, 30_000, 60_000\];/.test(src), 'backoff 5s/10s/30s/60s');
+      assert.ok(connect.indexOf('getMe()') < connect.indexOf('startPollingLoop()'), 'polling starts after getMe');
+      assert.ok(!/writeFileSync\(LOG_PATH, ''\)/.test(src), 'bot.log no longer truncated at start');
     },
   },
 ];

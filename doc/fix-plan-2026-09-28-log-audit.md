@@ -259,9 +259,9 @@ Audit `bot.stdout.log` ช่วง 2026-09-01 ถึง 2026-09-28 (โค้�
 - [x] E-5 commit `feat(bot): alert owner when the noon run was missed`
 
 ### F — startup + log
-- [ ] F-1 getMe retry backoff, ตั้ง cron ก่อน/ไม่ขึ้นกับ getMe
-- [ ] F-2 (ถ้า approve) `bot.log` append + rotate 5MB
-- [ ] F-3 commit `fix(bot): don't exit on startup Telegram failure`
+- [x] F-1 getMe retry backoff, ตั้ง cron ก่อน/ไม่ขึ้นกับ getMe
+- [x] F-2 (ถ้า approve) `bot.log` append + rotate 5MB
+- [x] F-3 commit `fix(bot): don't exit on startup Telegram failure`
 
 ### ปิดงาน
 - [ ] อัปเดต `requirements.md` §10 ตาม Q-R
