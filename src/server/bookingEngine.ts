@@ -44,7 +44,7 @@ import {
 import { getCourtId, updateCourtIds } from '../courtIdCache';
 import { waitUntilLocalTimestamp } from '../localClock';
 import { COURTS } from './configLoader';
-import { bangkokDate, screenshotsBaseDir } from './runReport';
+import { bangkokDate, formatResultLine, screenshotsBaseDir } from './runReport';
 import { sendTelegramMessage } from './telegramSend';
 import { getOwner } from './userStore';
 import * as path from 'path';
@@ -136,6 +136,13 @@ export function rotateCourts(priority: string[], k: number): string[] {
 // lost — surface a clear FAIL instead of probing for 30s per account.
 const DRIFT_SKIP_MS = 30_000;
 
+/** Ceiling on one account's booking after dispatch (Phase 3 and runStandard).
+ *  A healthy run settles every account in ≤ 8s; 90s leaves room for a full
+ *  standard-path login against a slow server (user-approved, Q-A1). On
+ *  2026-09-11/15 Chrome stopped answering and results trailed noon by 12 and
+ *  51 minutes — with this the DM goes out at T+90s at the latest. */
+export const ACCOUNT_SETTLE_BUDGET_MS = 90_000;
+
 type PrewarmStatus = 'page-ready' | 'login-ready' | 'needs-standard' | 'failed';
 
 interface PrewarmedAccount {
@@ -181,6 +188,78 @@ export interface BatchOptions {
   onAccountSettled?: (index: number, result: BookingResult) => void;
   /** Rehearsal: suppress the Telegram heads-up DM. */
   suppressAlerts?: boolean;
+  /** An account that blew ACCOUNT_SETTLE_BUDGET_MS was already reported as
+   *  ERROR via onAccountSettled; this receives its real result once the
+   *  booking finally finishes (report only — no second DM). */
+  onAccountLate?: (index: number, result: BookingResult) => void;
+}
+
+/**
+ * Race one account's booking against ACCOUNT_SETTLE_BUDGET_MS. If the budget
+ * wins, the account settles NOW as ERROR ("outcome unknown") so its DM is not
+ * held hostage; the booking keeps running detached — its own finally still
+ * closes its context (BR-04) — and its real result is logged as
+ * `[result-late]` and handed to `onLate`. Called right after bookOneAccount()
+ * has dispatched its submit, so it adds nothing before the POST.
+ */
+function settleWithinBudget(
+  work: Promise<BookingResult>,
+  account: Account,
+  courtAttempted: string,
+  onLate: (result: BookingResult) => void
+): Promise<BookingResult> {
+  const startedAt = new Date();
+  let timer: NodeJS.Timeout | undefined;
+  let timedOut = false;
+  const budget = new Promise<BookingResult>((resolve) => {
+    timer = setTimeout(() => {
+      timedOut = true;
+      const secs = ACCOUNT_SETTLE_BUDGET_MS / 1000;
+      console.warn(
+        `[bookingEngine] ${account.username} did not settle within ${secs}s — ` +
+          `reporting ERROR (real outcome unknown)`
+      );
+      resolve({
+        username: account.username,
+        triggered_at: startedAt.toISOString(),
+        court_attempted: courtAttempted,
+        court_booked: null,
+        slot: account.slot,
+        status: 'ERROR',
+        fail_reason: `timeout: ไม่จบภายใน ${secs}s — ผลจริงไม่ทราบ ให้เช็ค reservations.php`,
+        screenshot: '',
+        duration_ms: ACCOUNT_SETTLE_BUDGET_MS,
+        attempts: [],
+      });
+    }, ACCOUNT_SETTLE_BUDGET_MS);
+  });
+  work.then(
+    (r) => {
+      if (timer) clearTimeout(timer);
+      if (!timedOut) return;
+      console.log(formatResultLine(r, '[result-late]'));
+      try {
+        onLate(r);
+      } catch {
+        /* callback errors must not affect the batch */
+      }
+    },
+    () => {
+      if (timer) clearTimeout(timer);
+    }
+  );
+  return Promise.race([work, budget]);
+}
+
+/**
+ * Run `teardown` once every dispatched booking has really finished. After a
+ * healthy run they all have, so this is immediate. When the settle budget
+ * cut some accounts loose, closing their pages/browser now would kill the
+ * very work whose real outcome `[result-late]` is waiting for — the teardown
+ * waits for it instead (the batch's results were already returned).
+ */
+function afterInFlight(inFlight: Promise<unknown>[], teardown: () => void): void {
+  void Promise.allSettled(inFlight).then(() => teardown());
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -462,15 +541,19 @@ export async function runStandard(
   // Same-slot de-confliction applies here too: each account walks the court
   // list from its own rotated starting point.
   const rotations = computeSlotRotations(accounts);
+  const priorities = rotations.map((k) => rotateCourts(COURTS, k));
   const flowBase = baseFlowOptions(browser, opts, new Date());
+  let dispatched: Promise<BookingResult>[] = [];
   try {
     const firedAt = new Date();
+    dispatched = accounts.map((account, i) =>
+      bookOneAccount(account, { ...flowBase, courtPriority: priorities[i] })
+    );
     const results = await Promise.all(
-      accounts.map((account, i) =>
-        bookOneAccount(account, {
-          ...flowBase,
-          courtPriority: rotateCourts(COURTS, rotations[i]),
-        }).then((r) => {
+      dispatched.map((p, i) =>
+        settleWithinBudget(p, accounts[i], priorities[i][0] ?? '', (late) =>
+          opts.onAccountLate?.(i, late)
+        ).then((r) => {
           try {
             opts.onAccountSettled?.(i, r);
           } catch {
@@ -490,8 +573,11 @@ export async function runStandard(
     };
   } finally {
     // Accounts closed their own contexts (they own them on the standard
-    // path); only the shared browser remains — detached, timed.
-    void closeWithTiming('browser (standard)', () => browser.close());
+    // path); only the shared browser remains — detached, timed, and only
+    // after any account still running past its settle budget has finished.
+    afterInFlight(dispatched, () =>
+      void closeWithTiming('browser (standard)', () => browser.close())
+    );
   }
 }
 
@@ -547,6 +633,7 @@ export async function runPrewarmedBatch(
   }
 
   let launched: Browser | undefined;
+  let dispatched: Promise<BookingResult>[] = [];
   try {
     const tLaunch = Date.now();
     const browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -717,32 +804,35 @@ export async function runPrewarmedBatch(
     );
 
     // Phase 3: single synchronous dispatch across ALL accounts.
+    dispatched = entries.map((e, i) => {
+      const plan = dispatchPlan[i];
+      const base = { ...flowBase, courtPriority: plan.priority };
+      if (e.status === 'page-ready' && e.page) {
+        return bookOneAccount(e.account, {
+          ...base,
+          prewarmedBookingPage: e.page,
+          prewarmedCourtLabel: plan.courtLabel,
+          prewarmedCourtValue: plan.courtValue,
+        });
+      } else if (e.status === 'login-ready' && e.page) {
+        return bookOneAccount(e.account, { ...base, loginReadyPage: e.page });
+      }
+      return bookOneAccount(e.account, base);
+    });
+    // Every submit is in flight — only now arm the per-account budgets.
     const results = await Promise.all(
-      entries.map((e, i) => {
-        const plan = dispatchPlan[i];
-        const base = { ...flowBase, courtPriority: plan.priority };
-        let p: Promise<BookingResult>;
-        if (e.status === 'page-ready' && e.page) {
-          p = bookOneAccount(e.account, {
-            ...base,
-            prewarmedBookingPage: e.page,
-            prewarmedCourtLabel: plan.courtLabel,
-            prewarmedCourtValue: plan.courtValue,
-          });
-        } else if (e.status === 'login-ready' && e.page) {
-          p = bookOneAccount(e.account, { ...base, loginReadyPage: e.page });
-        } else {
-          p = bookOneAccount(e.account, base);
-        }
-        return p.then((r) => {
+      dispatched.map((p, i) =>
+        settleWithinBudget(p, entries[i].account, dispatchPlan[i].priority[0] ?? '', (late) =>
+          opts.onAccountLate?.(i, late)
+        ).then((r) => {
           try {
             opts.onAccountSettled?.(i, r);
           } catch {
             /* callback errors must not affect the batch */
           }
           return r;
-        });
-      })
+        })
+      )
     );
 
     return {
@@ -757,8 +847,11 @@ export async function runPrewarmedBatch(
     if (outageTimer) clearTimeout(outageTimer);
     // Detached teardown — results/DMs never wait on Chrome shutdown.
     if (launched) {
-      void cleanupBatch(entries, launched).catch((err) =>
-        console.warn(`[bookingEngine] detached cleanup error: ${err}`)
+      const b = launched;
+      afterInFlight(dispatched, () =>
+        void cleanupBatch(entries, b).catch((err) =>
+          console.warn(`[bookingEngine] detached cleanup error: ${err}`)
+        )
       );
     }
   }

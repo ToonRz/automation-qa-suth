@@ -236,13 +236,13 @@ Audit `bot.stdout.log` ช่วง 2026-09-01 ถึง 2026-09-28 (โค้�
 - [x] D-6 commit `feat(bot): write §7 JSON report and per-account result log`
 
 ### A — Phase 3 bounds
-- [ ] A-1 `AbortController` ใน `setSelectionAndSubmitViaFetch`, `fetchAllReservedTimes`, `verifyBookedOnReservations`
-- [ ] A-2 submit abort → ผ่าน `confirmViaReservationsIfUnclear` ก่อนตัดสิน
-- [ ] A-3 `newContext` race 20s ใน `bookOneAccount` standard path
-- [ ] A-4 `withSettleBudget()` ครอบ `bookOneAccount` ใน Phase 3 + `runStandard`; late result → `[result-late]` + `.late.json`
-- [ ] A-5 test: mock server ค้าง POST / ค้างทุก request (ตาม acceptance ของ A)
+- [x] A-1 `AbortController` ใน `setSelectionAndSubmitViaFetch`, `fetchAllReservedTimes`, `verifyBookedOnReservations`
+- [x] A-2 submit abort → ผ่าน `confirmViaReservationsIfUnclear` ก่อนตัดสิน
+- [x] A-3 `newContext` race 20s ใน `bookOneAccount` standard path
+- [x] A-4 `withSettleBudget()` ครอบ `bookOneAccount` ใน Phase 3 + `runStandard`; late result → `[result-late]` + `.late.json`
+- [x] A-5 test: mock server ค้าง POST / ค้างทุก request (ตาม acceptance ของ A)
 - [ ] A-6 test: `npm run test:fast-confirm` + rehearse ผลเหมือนเดิม
-- [ ] A-7 commit `fix(engine): bound phase-3 per-account time and in-page fetches`
+- [x] A-7 commit `fix(engine): bound phase-3 per-account time and in-page fetches`
 
 ### B — cancel cut rounds / fresh browser
 - [ ] B-1 registry context ใน `prewarmOne` + ปิด in-flight ตอน seal ใน `prewarmRound`

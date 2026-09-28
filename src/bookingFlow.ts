@@ -143,6 +143,19 @@ const DEFAULT_RETRY_DEADLINE_MS = 30_000;
 const SUBMIT_RESULT_TIMEOUT_MS = 15_000;
 const SUBMIT_REDIRECT_SETTLE_MS = 1_500;
 
+// Ceilings for the fetch() calls made INSIDE the page (AbortController).
+// Playwright timeouts do not cover a page.evaluate that awaits a fetch, so
+// without these a server that stops answering holds the account forever.
+// The submit reuses the click path's 15s; the two read-only lookups get the
+// same 8s as getBadmintonCourts.
+const RESERVED_TIMES_FETCH_TIMEOUT_MS = 8_000;
+const RESERVATIONS_CHECK_TIMEOUT_MS = 8_000;
+/** browser.newContext() has no Playwright timeout; a hung Chrome held the
+ *  standard path indefinitely on 2026-09-11/15. */
+const NEW_CONTEXT_TIMEOUT_MS = 20_000;
+/** What setSelectionAndSubmitViaFetch reports when the submit is aborted. */
+const SUBMIT_TIMEOUT_ERROR = 'submit timeout';
+
 /**
  * How the booking POST is fired at the tick. Env-switchable for rollback:
  *
@@ -315,7 +328,7 @@ export async function fetchAllReservedTimes(
   courtValues: string[]
 ): Promise<Map<string, string[]>> {
   const result = await page.evaluate(
-    async (values) => {
+    async ({ values, timeoutMs }) => {
       // Compute today's date in the page's local context — matches the date the
       // page's own onchange handler sends in its AJAX request.
       const d = new Date();
@@ -335,6 +348,10 @@ export async function fetchAllReservedTimes(
 
       await Promise.all(
         values.map(async (v) => {
+          // Per-court ceiling — an unanswered request counts as "no data"
+          // (same as any other fetch error below).
+          const ctrl = new AbortController();
+          const timer = setTimeout(() => ctrl.abort(), timeoutMs);
           try {
             const body = new URLSearchParams();
             body.set('court_id', v);
@@ -348,6 +365,7 @@ export async function fetchAllReservedTimes(
               },
               body: body.toString(),
               credentials: 'same-origin',
+              signal: ctrl.signal,
             });
             if (!res.ok) {
               out[v] = [];
@@ -363,12 +381,14 @@ export async function fetchAllReservedTimes(
             }
           } catch {
             out[v] = [];
+          } finally {
+            clearTimeout(timer);
           }
         })
       );
       return out;
     },
-    courtValues
+    { values: courtValues, timeoutMs: RESERVED_TIMES_FETCH_TIMEOUT_MS }
   );
 
   const map = new Map<string, string[]>();
@@ -603,6 +623,10 @@ async function setSelectionAndSubmitViaFetch(
         params.append(submitter.name, submitter.value ?? '');
       }
 
+      // The ceiling also covers reading the body. Armed after the request
+      // is built — nothing is awaited before the fetch goes out.
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), args.timeoutMs);
       try {
         const res = await fetch(action, {
           method,
@@ -610,14 +634,23 @@ async function setSelectionAndSubmitViaFetch(
           body: params.toString(),
           credentials: 'same-origin',
           redirect: 'follow',
+          signal: ctrl.signal,
         });
         const text = await res.text();
         return { ok: true, status: res.status, url: res.url, text };
       } catch (e) {
-        return { ok: false, error: String(e) };
+        return { ok: false, error: ctrl.signal.aborted ? args.timeoutError : String(e) };
+      } finally {
+        clearTimeout(timer);
       }
     },
-    { courtValue, courtLabel, slot }
+    {
+      courtValue,
+      courtLabel,
+      slot,
+      timeoutMs: SUBMIT_RESULT_TIMEOUT_MS,
+      timeoutError: SUBMIT_TIMEOUT_ERROR,
+    }
   );
 }
 
@@ -629,14 +662,21 @@ async function setSelectionAndSubmitViaFetch(
  */
 async function verifyBookedOnReservations(page: Page, username: string): Promise<boolean> {
   try {
-    const res: PageFetchResult = await page.evaluate(async () => {
+    const res: PageFetchResult = await page.evaluate(async (timeoutMs) => {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), timeoutMs);
       try {
-        const r = await fetch('reservations.php', { credentials: 'same-origin' });
+        const r = await fetch('reservations.php', {
+          credentials: 'same-origin',
+          signal: ctrl.signal,
+        });
         return { ok: true, status: r.status, url: r.url, text: await r.text() };
       } catch (e) {
         return { ok: false, error: String(e) };
+      } finally {
+        clearTimeout(timer);
       }
-    });
+    }, RESERVATIONS_CHECK_TIMEOUT_MS);
     if (!res.ok || !res.text) return false;
     if (!res.text.includes(RESERVATION_PAGE_HEADER)) return false;
     const esc = username.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -689,7 +729,20 @@ async function attemptBookingFetch(
     slot
   );
   if (!res.ok) {
-    return { type: 'submit-fail', reason: `fetch submit failed: ${res.error ?? 'unknown'}` };
+    const failed: AttemptOutcome = {
+      type: 'submit-fail',
+      reason: `fetch submit failed: ${res.error ?? 'unknown'}`,
+    };
+    if (res.error !== SUBMIT_TIMEOUT_ERROR) return failed;
+    // No answer within the ceiling — but the POST may still have been
+    // accepted server-side. Check reservations BEFORE the caller moves on to
+    // another court, or a slow success becomes a double booking.
+    const outcome = await confirmViaReservationsIfUnclear(page, username, failed);
+    console.log(
+      `[perf] ${username} fetch_submit court=${court.label} slot=${slot} ` +
+        `post=${Date.now() - t0}ms status=- outcome=${outcome.type} (${SUBMIT_TIMEOUT_ERROR})`
+    );
+    return outcome;
   }
   const alerts = extractAlertMessages(res.text ?? '');
   let outcome = classifyOutcome(res.url ?? page.url(), res.text ?? '', username, alerts);
@@ -808,6 +861,34 @@ export async function closeWithTiming(tag: string, close: () => Promise<void>): 
     return;
   }
   console.log(`[cleanup] ${tag} close=${Date.now() - t0}ms`);
+}
+
+/**
+ * browser.newContext() bounded by `ms`. On timeout this throws (the caller's
+ * catch reports ERROR); a context that still shows up afterwards is closed
+ * the moment it arrives, so giving up never leaks one (BR-04).
+ */
+async function newContextWithin(
+  browser: Browser,
+  username: string,
+  ms: number
+): Promise<BrowserContext> {
+  const creating = browser.newContext({ storageState: undefined });
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`newContext timeout (${ms / 1000}s)`)), ms);
+  });
+  try {
+    return await Promise.race([creating, timedOut]);
+  } catch (err) {
+    creating.then(
+      (late) => void closeWithTiming(`late ctx ${username}`, () => late.close()),
+      () => {}
+    );
+    throw err;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /**
@@ -1171,7 +1252,7 @@ export async function bookOneAccount(
         browser = await chromium.launch({ channel: 'chrome', headless: true });
         ownBrowser = true;
       }
-      context = await browser.newContext({ storageState: undefined });
+      context = await newContextWithin(browser, account.username, NEW_CONTEXT_TIMEOUT_MS);
       page = await context.newPage();
       await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 30000 });
       await page.locator('input[name="username"]').fill(account.username);

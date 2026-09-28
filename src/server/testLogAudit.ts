@@ -254,7 +254,21 @@ class Harness {
   launchDelayMs = 0;
   launchFail = false;
   pagesFrozen = false;
+  newContextFrozen = false;
   private heldPages: Array<() => void> = [];
+  private heldContexts: Array<() => void> = [];
+
+  contextGate(): Promise<void> {
+    if (!this.newContextFrozen) return Promise.resolve();
+    return new Promise((resolve) => this.heldContexts.push(resolve));
+  }
+
+  releaseContexts(): void {
+    this.newContextFrozen = false;
+    const held = this.heldContexts;
+    this.heldContexts = [];
+    for (const r of held) r();
+  }
 
   freezeAll(): void {
     this.mock.freeze();
@@ -262,6 +276,7 @@ class Harness {
   }
 
   releaseAll(): void {
+    this.releaseContexts();
     this.pagesFrozen = false;
     const held = this.heldPages;
     this.heldPages = [];
@@ -343,7 +358,10 @@ const realLaunch = playwright.chromium.launch.bind(playwright.chromium);
 function wrapBrowser(browser: Browser, idx: number): void {
   const realNewContext = browser.newContext.bind(browser);
   browser.newContext = async (options) => {
-    const ctx = await realNewContext(options);
+    // A hung newContext: the context is requested now, the answer is late.
+    const creating = realNewContext(options);
+    await h.contextGate();
+    const ctx = await creating;
     const rec: CtxRecord = {
       id: h.contexts.length,
       browser: idx,
@@ -359,7 +377,8 @@ function wrapBrowser(browser: Browser, idx: number): void {
       if (rec.closeCalledAt === null) rec.closeCalledAt = Date.now();
       return realClose(opts);
     };
-    await ctx.route(`${SITE}/**`, (route) => forward(route, rec));
+    // Fails only when the context is already gone (browser closed meanwhile).
+    await ctx.route(`${SITE}/**`, (route) => forward(route, rec)).catch(() => {});
     const realNewPage = ctx.newPage.bind(ctx);
     ctx.newPage = async () => {
       const page = await realNewPage();
@@ -484,6 +503,18 @@ function assertS7(accounts: BookingResult[], n: number): void {
   }
 }
 
+/** Invariants of a healthy run that the new bounds must never disturb. */
+function assertUntouchedNormalRun(): void {
+  const bad = h.lines.filter((l) => /timeout|did not settle|result-late/i.test(l.text));
+  assert.deepEqual(bad.map((l) => l.text), [], 'no timeout / late lines on a healthy run');
+}
+
+/** Freeze pages + HTTP just before the tick; release `releaseAfterMs` after it. */
+function freezeAroundTick(target: Date, releaseAfterMs: number): void {
+  setTimeout(() => h.freezeAll(), target.getTime() - Date.now() - 300);
+  setTimeout(() => h.releaseAll(), target.getTime() - Date.now() + releaseAfterMs);
+}
+
 function daysAgo(n: number): string {
   return runReport.bangkokDate(new Date(Date.now() - n * 86_400_000));
 }
@@ -553,6 +584,7 @@ const scenarios: Scenario[] = [
         'every account PASS'
       );
       assert.equal(settled.length, 3);
+      assertUntouchedNormalRun();
     },
   },
   {
@@ -605,6 +637,7 @@ const scenarios: Scenario[] = [
         assert.equal(a.screenshot, path.join(shots, day, `${a.username}.png`), 'dated screenshot path');
         assert.ok(fs.existsSync(a.screenshot), `screenshot written for ${a.username}`);
       }
+      assertUntouchedNormalRun();
       for (const f of keep) assert.ok(fs.existsSync(path.join(reports, f)), `kept ${f}`);
       for (const f of drop) assert.ok(!fs.existsSync(path.join(reports, f)), `removed ${f}`);
       assert.ok(!fs.existsSync(path.join(shots, old)), 'removed the 31-day-old screenshot folder');
@@ -663,6 +696,114 @@ const scenarios: Scenario[] = [
       } finally {
         process.env.REPORTS_DIR = saved;
       }
+    },
+  },
+  {
+    name: 'a-post-hang',
+    about: 'A: booking POST never answers → abort at 15s, reservations checked first; row found → no next court, no row → next attempt',
+    run: async () => {
+      h.mock.plan.bookPost = (user, n) =>
+        n > 0 ? 'ok' : user === 'mock-u1' ? 'hang-books' : user === 'mock-u2' ? 'hang' : 'ok';
+      process.env.PREWARM_LEAD_SEC = '45';
+      const target = new Date(Date.now() + 45_000);
+      const { settled, onAccountSettled } = collectSettled();
+      const res = await engine.runPrewarmedBatch(mockAccounts(2), target, { onAccountSettled });
+      const byUser = new Map(res.results.map((r) => [r.username, r]));
+      const reservationsGets = (user: string) =>
+        h.mock.requests.filter((r) => r.user === user && r.path === '/reservations.php');
+
+      // mock-u1: the server booked, the answer never came.
+      const u1Posts = h.mock.postsBy('mock-u1');
+      assert.equal(u1Posts.length, 1, 'mock-u1: no second POST after reservations showed the row');
+      assert.equal(byUser.get('mock-u1')?.status, 'PASS', 'mock-u1: PASS via reservations.php');
+      const u1Perf = h.find(
+        /\[perf\] mock-u1 fetch_submit .*post=(\d+)ms status=- outcome=success \(submit timeout\)/
+      );
+      assert.equal(u1Perf.length, 1, 'mock-u1: submit timeout logged once');
+      const u1Ms = Number(/post=(\d+)ms/.exec(u1Perf[0].text)?.[1]);
+      assert.ok(u1Ms >= 15_000 && u1Ms < 16_500, `mock-u1: aborted at ~15s (${u1Ms}ms incl. check)`);
+      const u1Check = reservationsGets('mock-u1')[0];
+      assert.ok(
+        u1Check && u1Check.at - u1Posts[0].at >= 14_900,
+        'mock-u1: reservations checked after the abort'
+      );
+
+      // mock-u2: nothing booked — the check comes back empty, the next attempt follows.
+      const u2Posts = h.mock.postsBy('mock-u2');
+      assert.equal(u2Posts.length, 2, 'mock-u2: one retry after the empty check');
+      const u2Check = reservationsGets('mock-u2')[0];
+      assert.ok(
+        u2Check && u2Check.at > u2Posts[0].at && u2Check.at < u2Posts[1].at,
+        'mock-u2: reservations checked between the timed-out POST and the retry'
+      );
+      assert.equal(byUser.get('mock-u2')?.status, 'PASS');
+      assert.equal(settled.length, 2);
+    },
+  },
+  {
+    name: 'a-budget',
+    about: 'A: Chrome + site stop answering at the tick → every account ERROR timeout at 90s ±1s, settled at once, later [result-late] + .late.json',
+    run: async () => {
+      process.env.PREWARM_LEAD_SEC = '45';
+      const target = new Date(Date.now() + 45_000);
+      freezeAroundTick(target, 95_000);
+      const { reporter, settled, onAccountSettled } = botWiring(target, 3);
+      const res = await engine.runPrewarmedBatch(mockAccounts(3), target, {
+        onAccountSettled,
+        onAccountLate: (i, r) => reporter.late(i, r),
+      });
+      const firedAt = Date.parse(res.fired_at);
+      assert.equal(settled.length, 3, 'each account settled exactly once');
+      for (const st of settled) {
+        assert.equal(st.result.status, 'ERROR');
+        assert.equal(
+          st.result.fail_reason,
+          'timeout: ไม่จบภายใน 90s — ผลจริงไม่ทราบ ให้เช็ค reservations.php'
+        );
+        const after = st.at - firedAt;
+        assert.ok(Math.abs(after - 90_000) <= 1_000, `${st.result.username} settled at +${after}ms`);
+      }
+      const file = reporter.write(res);
+      assertS7(readReport(file).accounts, 3);
+
+      for (const n of [1, 2, 3]) {
+        await h.waitFor(new RegExp(`^\\[result-late\\] mock-u${n} PASS `), 20_000);
+      }
+      await h.waitFor(/\[report\] late results → /, 5_000);
+      await sleep(500);
+      const lateFile = file!.replace(/\.json$/, '.late.json');
+      const lateReport = JSON.parse(fs.readFileSync(lateFile, 'utf-8')) as { late: BookingResult[] };
+      assert.equal(lateReport.late.length, 3, '.late.json holds every late result');
+      assert.equal(settled.length, 3, 'no second settle (no second DM) for late results');
+    },
+  },
+  {
+    name: 'a-newcontext',
+    about: 'A: browser.newContext() hangs on the standard path → ERROR at 20s; the context that shows up later is closed',
+    run: async () => {
+      h.mock.plan.login = 'reset'; // every prewarm fails → standard path at the tick
+      process.env.PREWARM_LEAD_SEC = '45';
+      const target = new Date(Date.now() + 45_000);
+      setTimeout(() => (h.newContextFrozen = true), target.getTime() - Date.now() - 300);
+      setTimeout(() => h.releaseContexts(), target.getTime() - Date.now() + 25_000);
+      const { settled, onAccountSettled } = collectSettled();
+      const res = await engine.runPrewarmedBatch(mockAccounts(2), target, {
+        onAccountSettled,
+        suppressAlerts: true,
+      });
+      const firedAt = Date.parse(res.fired_at);
+      assert.equal(settled.length, 2);
+      for (const st of settled) {
+        assert.equal(st.result.status, 'ERROR');
+        assert.match(String(st.result.fail_reason), /newContext timeout \(20s\)/);
+        const after = st.at - firedAt;
+        assert.ok(after >= 19_500 && after < 22_000, `${st.result.username} gave up at +${after}ms`);
+      }
+      await h.waitFor(/\[cleanup\] late ctx mock-u1 close=/, 15_000);
+      await h.waitFor(/\[cleanup\] late ctx mock-u2 close=/, 5_000);
+      const lateCtx = h.contexts.filter((c) => c.createdAt >= firedAt + 20_000);
+      assert.equal(lateCtx.length, 2, 'both late contexts were created after the release');
+      assert.ok(lateCtx.every((c) => c.closeCalls === 1), 'each late context closed exactly once');
     },
   },
 ];

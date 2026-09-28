@@ -1454,6 +1454,11 @@ async function runScheduledBooking(): Promise<void> {
     );
   };
 
+  // Account that blew the settle budget: already DM'd as ERROR — its real
+  // result only goes into the report.
+  const onAccountLate = (index: number, result: BookingResult): void =>
+    reporter.late(index, result);
+
   const onAccountSettled = (index: number, result: BookingResult): void => {
     console.log(formatResultLine(result));
     reporter.settle(index, result);
@@ -1473,11 +1478,11 @@ async function runScheduledBooking(): Promise<void> {
   let engine: EngineResult;
   try {
     if (usePrewarm) {
-      engine = await runPrewarmedBatch(flat, fireTime, { onAccountSettled });
+      engine = await runPrewarmedBatch(flat, fireTime, { onAccountSettled, onAccountLate });
     } else {
       console.log('[scheduler] DEEP_PREWARM=0 — standard mode (no prewarm), waiting for tick');
       await waitUntilLocalTimestamp(fireTime.getTime());
-      engine = await runStandard(flat, { onAccountSettled });
+      engine = await runStandard(flat, { onAccountSettled, onAccountLate });
     }
   } catch (err) {
     console.error(`[scheduler] booking batch failed: ${err}`);

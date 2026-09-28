@@ -59,6 +59,7 @@ async function main(): Promise<void> {
       console.log(formatResultLine(r));
       reporter.settle(i, r);
     },
+    onAccountLate: (i, r) => reporter.late(i, r),
   });
   reporter.write(engine);
 
