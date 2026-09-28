@@ -6,14 +6,20 @@
 // that data is YESTERDAY's (the server clears bookings at 12:00), so on busy
 // days the target court has no <option> — and without its value id the noon
 // submit would first have to reload booking.php while the server is being
-// hammered. Court ids are stable database ids, so we cache every (label,
-// value) pair we ever see; at noon a login-ready page can then inject the
-// option and POST immediately, no reload.
+// hammered. We cache every (label, value) pair we ever see; at noon a
+// login-ready page can then inject the option and POST immediately, no reload.
+//
+// Ids are NOT permanently stable: the site renumbers courts from time to time
+// (July: แบดมินตัน3=15; September: แบดมินตัน3=18). A stale id is NOT harmless —
+// if the id now belongs to another court, the POST books THAT court. On
+// 2026-09-28 แบดมินตัน5 and แบดมินตัน6 both cached "21", so "court5" bookings
+// landed on court6 and the real court5 was never tried. Hence: one id maps to
+// at most one label, and a freshly observed pair evicts any other label still
+// holding that id.
 //
 // The cache is merged opportunistically from every fresh dropdown read (deep
-// prewarm + the noon fallback loop, which sees the full post-reset dropdown).
-// A wrong/stale id is harmless: the server rejects the POST and the account
-// falls into the normal retry loop, which reads the live dropdown.
+// prewarm + the noon fallback loop) and from the reservations.php proof row
+// after a PASS (the label the server actually booked for the submitted id).
 //
 // Seeded from reports/slots-discovered.json (2026-07-13):
 //   แบดมินตัน3=15, แบดมินตัน4=16, แบดมินตัน6=18
@@ -46,15 +52,26 @@ export function getCourtId(label: string): string | undefined {
 
 /**
  * Merge freshly-observed (label, value) pairs into the cache and persist if
- * anything new/changed. Safe to call on every dropdown read — it no-ops when
- * nothing changed. Never throws (a failed persist only costs tomorrow's
- * fast path, and the in-memory copy is already updated).
+ * anything new/changed. A fresh observation wins: any OTHER label still
+ * holding the same value is evicted (its id was reassigned). Safe to call on
+ * every dropdown read — it no-ops when nothing changed. Never throws (a failed
+ * persist only costs tomorrow's fast path, and the in-memory copy is already
+ * updated).
  */
 export function updateCourtIds(courts: Array<{ label: string; value: string }>): void {
   const data = load();
   let dirty = false;
   for (const c of courts) {
     if (!c.label || !c.value) continue;
+    for (const [label, value] of Object.entries(data)) {
+      if (label !== c.label && value === c.value) {
+        console.warn(
+          `[courtIdCache] id ${value} now belongs to ${c.label} — evicting stale ${label}`
+        );
+        delete data[label];
+        dirty = true;
+      }
+    }
     if (data[c.label] !== c.value) {
       data[c.label] = c.value;
       dirty = true;

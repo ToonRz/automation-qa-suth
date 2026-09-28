@@ -727,6 +727,53 @@ async function gotoReservationsProof(page: Page): Promise<void> {
   }
 }
 
+/**
+ * Report the court the server ACTUALLY booked, read from the reservations.php
+ * row (columns ชื่อผู้ใช้ / สนาม / เวลา), instead of the label we submitted.
+ * A stale cached id books whatever court now owns it — on 2026-09-28 three
+ * "แบดมินตัน5" PASSes were really แบดมินตัน6. When the row disagrees, the
+ * result is corrected and the cache learns (label, submittedValue), which also
+ * evicts the wrong label. Best-effort: if the row can't be read (page not on
+ * reservations.php, layout change), the submitted label stands.
+ */
+async function recordActualCourt(
+  page: Page,
+  result: BookingResult,
+  username: string,
+  submittedValue: string | undefined
+): Promise<void> {
+  let actual: unknown;
+  try {
+    actual = await page.evaluate((user) => {
+      const rows = Array.from(document.querySelectorAll('table tr'));
+      const header = rows.find((r) => r.querySelector('th'));
+      const heads = header
+        ? Array.from(header.querySelectorAll('th')).map((c) => (c.textContent ?? '').trim())
+        : [];
+      const userCol = heads.indexOf('ชื่อผู้ใช้');
+      const courtCol = heads.indexOf('สนาม');
+      if (courtCol < 0) return null;
+      const cells = rows
+        .map((r) => Array.from(r.querySelectorAll('td')).map((c) => (c.textContent ?? '').trim()))
+        .filter((c) => c.length > courtCol);
+      const mine =
+        cells.find((c) => userCol >= 0 && c[userCol] === user) ??
+        (cells.length === 1 ? cells[0] : undefined);
+      return mine ? mine[courtCol] : null;
+    }, username);
+  } catch {
+    return; // mock page / navigation race — keep the submitted label
+  }
+  if (typeof actual !== 'string' || !actual.includes('แบดมินตัน')) return;
+  if (actual === result.court_booked) return;
+  console.warn(
+    `[bookingFlow] ${username} submitted ${result.court_booked} (id=${submittedValue ?? '?'}) ` +
+      `but reservations.php shows ${actual} — reporting ${actual}`
+  );
+  result.court_booked = actual;
+  if (submittedValue) updateCourtIds([{ label: actual, value: submittedValue }]);
+}
+
 // ---------- timed, non-blocking cleanup ----------
 
 const CLOSE_HANG_WARN_MS = 30_000;
@@ -1015,6 +1062,7 @@ export async function bookOneAccount(
         result.status = 'PASS';
         result.fail_reason = null;
         if (!page.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(page);
+        await recordActualCourt(page, result, account.username, options.prewarmedCourtValue);
         await shoot(page, screenshot);
         return result;
       }
@@ -1083,6 +1131,7 @@ export async function bookOneAccount(
           result.status = 'PASS';
           result.fail_reason = null;
           if (!page.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(page);
+          await recordActualCourt(page, result, account.username, cachedTarget.value);
           await shoot(page, screenshot);
           return result;
         }
@@ -1168,7 +1217,11 @@ export async function bookOneAccount(
       for (const label of priorityCourts) {
         if (knownCourts.some((c) => c.label === label)) continue;
         const value = getCourtId(label);
-        if (value !== undefined) knownCourts.push({ label, value });
+        // Never inject an id the dropdown already shows under another label —
+        // that id was reassigned, and trying it twice wastes a fallback step.
+        if (value !== undefined && !knownCourts.some((c) => c.value === value)) {
+          knownCourts.push({ label, value });
+        }
       }
     }
 
@@ -1188,7 +1241,7 @@ export async function bookOneAccount(
     const deadline = Date.now() + deadlineMs;
     const courtsToTry = buildCourtPriority(priorityCourts, knownCourts);
 
-    let booked: { court: string; slot: string } | null = null;
+    let booked: { court: string; value: string; slot: string } | null = null;
     let earlyExit: 'already-booked' | null = null;
     // After a failed submit, the server may redirect us to a confirmation/failure
     // page. We only need to navigate back to booking.php before the NEXT attempt.
@@ -1221,7 +1274,7 @@ export async function bookOneAccount(
             slot: account.slot,
             outcome: 'success',
           });
-          booked = { court: court.label, slot: account.slot };
+          booked = { court: court.label, value: court.value, slot: account.slot };
           break outer;
         } else if (graceOutcome.type === 'already-booked') {
           result.attempts.push({
@@ -1258,7 +1311,7 @@ export async function bookOneAccount(
 
       if (options.dryRun) {
         result.attempts.push({ court: court.label, slot, outcome: 'dry-run-would-book' });
-        booked = { court: court.label, slot };
+        booked = { court: court.label, value: court.value, slot };
         break outer;
       }
 
@@ -1272,7 +1325,7 @@ export async function bookOneAccount(
       const outcome = await attemptBooking(page, court, slot, account.username);
       if (outcome.type === 'success') {
         result.attempts.push({ court: court.label, slot, outcome: 'success' });
-        booked = { court: court.label, slot };
+        booked = { court: court.label, value: court.value, slot };
         break outer;
       }
       if (outcome.type === 'already-booked') {
@@ -1308,6 +1361,7 @@ export async function bookOneAccount(
         // Fetch submits never navigate — park on reservations.php so the §7
         // proof screenshot shows the booking row.
         if (!page.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(page);
+        await recordActualCourt(page, result, account.username, booked.value);
       }
       await shoot(page, screenshot);
       return result;
