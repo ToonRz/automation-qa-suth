@@ -469,10 +469,52 @@ export async function runPrewarmedBatch(
   opts: BatchOptions = {}
 ): Promise<EngineResult> {
   const start = Date.now();
-  const browser = await chromium.launch({ channel: 'chrome', headless: true });
-  let entries: PrewarmedAccount[] = [];
+  // Entries exist before the browser does, so the outage timer below reads
+  // real partial state even while the launch or Phase 1 is still in flight.
+  const entries: PrewarmedAccount[] = pendingEntries(accounts);
+
+  // Phase 0a: arm the total-outage DM on the wall clock. EVERY account
+  // failing at once is an infrastructure signal (site down, network down)
+  // rather than per-account trouble, and it is actionable only while the
+  // retry window is still open. Previously this check ran after Phase 1 —
+  // which meant that on 2026-08-31, the one run that needed it, it fired at
+  // 12:05 alongside the results instead of at 11:56 with 4 minutes still on
+  // the clock. A timer does not care whether Phase 1 came back.
+  //
+  // Armed BEFORE chromium.launch(): on 2026-09-11 the launch alone took ~2
+  // minutes, so by the time the old code reached this point T-4m was already
+  // gone and the timer was never set — no 🚨 at all. Whatever arrives late
+  // (cron, launch) is caught by the after-first-round check further down.
+  const alertAt = targetTime.getTime() - OUTAGE_ALERT_BEFORE_MS;
+  let outageAlerted = false;
+  const alertIfTotalOutage = (when: string): void => {
+    if (outageAlerted) return;
+    if (entries.length === 0 || !entries.every((e) => e.status === 'failed')) return;
+    outageAlerted = true;
+    console.warn(
+      `[bookingEngine] total outage at ${when} ` +
+        `(${entries.length}/${entries.length} failed) — DMing owner`
+    );
+    void sendPrewarmOutageAlert(entries, targetTime).catch((err) =>
+      console.error(`[bookingEngine] outage DM failed: ${err}`)
+    );
+  };
   let outageTimer: NodeJS.Timeout | undefined;
+  if (!opts.suppressAlerts && alertAt > Date.now()) {
+    outageTimer = setTimeout(
+      () => alertIfTotalOutage(`T-${OUTAGE_ALERT_BEFORE_MS / 1000}s`),
+      alertAt - Date.now()
+    );
+    outageTimer.unref?.();
+  }
+
+  let launched: Browser | undefined;
   try {
+    const tLaunch = Date.now();
+    const browser = await chromium.launch({ channel: 'chrome', headless: true });
+    launched = browser;
+    console.log(`[perf] browser launch=${Date.now() - tLaunch}ms`);
+
     // Phase 0: sleep until the prewarm window opens.
     const prewarmFireAt = targetTime.getTime() - prewarmLeadMs();
     if (Date.now() < prewarmFireAt) {
@@ -486,33 +528,6 @@ export async function runPrewarmedBatch(
     // stable throughout).
     const rotations = computeSlotRotations(accounts);
     const priorities = rotations.map((k) => rotateCourts(COURTS, k));
-
-    // Entries exist before any prewarm runs so the outage timer below reads
-    // real partial state even while Phase 1 is still in flight.
-    entries = pendingEntries(accounts);
-
-    // Phase 0b: arm the total-outage DM on the wall clock. EVERY account
-    // failing at once is an infrastructure signal (site down, network down)
-    // rather than per-account trouble, and it is actionable only while the
-    // retry window is still open. Previously this check ran after Phase 1 —
-    // which meant that on 2026-08-31, the one run that needed it, it fired at
-    // 12:05 alongside the results instead of at 11:56 with 4 minutes still on
-    // the clock. A timer does not care whether Phase 1 came back.
-    const alertAt = targetTime.getTime() - OUTAGE_ALERT_BEFORE_MS;
-    if (!opts.suppressAlerts && alertAt > Date.now()) {
-      outageTimer = setTimeout(() => {
-        if (entries.length > 0 && entries.every((e) => e.status === 'failed')) {
-          console.warn(
-            `[bookingEngine] total outage at T-${OUTAGE_ALERT_BEFORE_MS / 1000}s ` +
-              `(${entries.length}/${entries.length} failed) — DMing owner`
-          );
-          void sendPrewarmOutageAlert(entries, targetTime).catch((err) =>
-            console.error(`[bookingEngine] outage DM failed: ${err}`)
-          );
-        }
-      }, alertAt - Date.now());
-      outageTimer.unref?.();
-    }
 
     // Phase 1: prewarm all accounts in parallel, bounded by the round budget
     // so a stalled site cannot eat the retry window (or noon itself).
@@ -529,6 +544,12 @@ export async function runPrewarmedBatch(
       if (e.status !== 'page-ready') {
         console.log(`[bookingEngine]   ${e.account.username}: ${e.status} (${e.error ?? 'no error'})`);
       }
+    }
+    // T-4m already passed (cron late, slow launch, long first round) — the
+    // timer either never armed or fired before this round's results existed.
+    // Check once now instead of skipping the alert.
+    if (!opts.suppressAlerts && Date.now() >= alertAt) {
+      alertIfTotalOutage('after first round (T-4m already passed)');
     }
 
     // Phase 1b: retry transient failures until T-RETRY_STOP_BEFORE_MS.
@@ -678,8 +699,10 @@ export async function runPrewarmedBatch(
   } finally {
     if (outageTimer) clearTimeout(outageTimer);
     // Detached teardown — results/DMs never wait on Chrome shutdown.
-    void cleanupBatch(entries, browser).catch((err) =>
-      console.warn(`[bookingEngine] detached cleanup error: ${err}`)
-    );
+    if (launched) {
+      void cleanupBatch(entries, launched).catch((err) =>
+        console.warn(`[bookingEngine] detached cleanup error: ${err}`)
+      );
+    }
   }
 }
