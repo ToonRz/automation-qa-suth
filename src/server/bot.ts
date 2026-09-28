@@ -48,7 +48,9 @@ import {
   User,
 } from './userStore';
 import { runPrewarmedBatch, runStandard } from './bookingEngine';
+import type { EngineResult } from './bookingEngine';
 import type { BookingResult } from '../bookingFlow';
+import { createRunReporter, formatResultLine } from './runReport';
 import { waitUntilLocalTimestamp } from '../localClock';
 import { sendTelegramMessage } from './telegramSend';
 
@@ -1432,6 +1434,9 @@ async function runScheduledBooking(): Promise<void> {
   const usePrewarm = process.env.DEEP_PREWARM !== '0';
   const modeLabel: 'prewarm' | 'standard' = usePrewarm ? 'prewarm' : 'standard';
   const dmPromises: Promise<void>[] = [];
+  // §7 JSON report — fed per account as results settle, so even a batch
+  // that throws leaves a report of whatever finished.
+  const reporter = createRunReporter({ fireTime, mode: modeLabel, count: flat.length });
 
   // DM each user the moment THEIR accounts are all settled — one slow account
   // in another group no longer delays this user's report.
@@ -1450,6 +1455,8 @@ async function runScheduledBooking(): Promise<void> {
   };
 
   const onAccountSettled = (index: number, result: BookingResult): void => {
+    console.log(formatResultLine(result));
+    reporter.settle(index, result);
     const g = indexToGroup[index];
     if (!g) return;
     g.results[index - g.start] = result;
@@ -1463,16 +1470,18 @@ async function runScheduledBooking(): Promise<void> {
     }
   };
 
+  let engine: EngineResult;
   try {
     if (usePrewarm) {
-      await runPrewarmedBatch(flat, fireTime, { onAccountSettled });
+      engine = await runPrewarmedBatch(flat, fireTime, { onAccountSettled });
     } else {
       console.log('[scheduler] DEEP_PREWARM=0 — standard mode (no prewarm), waiting for tick');
       await waitUntilLocalTimestamp(fireTime.getTime());
-      await runStandard(flat, { onAccountSettled });
+      engine = await runStandard(flat, { onAccountSettled });
     }
   } catch (err) {
     console.error(`[scheduler] booking batch failed: ${err}`);
+    reporter.write(undefined, err);
     for (const g of groups) {
       if (g.settled < g.count) {
         try {
@@ -1484,6 +1493,7 @@ async function runScheduledBooking(): Promise<void> {
     }
     return;
   }
+  reporter.write(engine);
 
   // Let in-flight per-group DMs land before the summary.
   await Promise.allSettled(dmPromises);

@@ -24,6 +24,7 @@
 import * as dotenv from 'dotenv';
 import { getAllUsers } from './userStore';
 import { runPrewarmedBatch, prewarmLeadMs } from './bookingEngine';
+import { createRunReporter, formatResultLine } from './runReport';
 
 dotenv.config();
 // Shrink the prewarm lead for rehearsal (engine reads this lazily, so setting
@@ -49,16 +50,17 @@ async function main(): Promise<void> {
   console.log(`lead:      ${Math.round(lead / 1000)}s | fake tick: ${target.toISOString()}`);
   console.log(`SUBMIT_VIA=${process.env.SUBMIT_VIA ?? '(unset → fetch)'}\n`);
 
+  // Same §7 report + [result] lines as the noon run (statuses are DRY-RUN).
+  const reporter = createRunReporter({ fireTime: target, mode: 'prewarm', count: flat.length });
   const engine = await runPrewarmedBatch(flat, target, {
     dryRun: true,
     suppressAlerts: true,
-    onAccountSettled: (_i, r) => {
-      console.log(
-        `  [settled] ${r.username.padEnd(14)} ${r.status.padEnd(8)} ` +
-          `${r.fail_reason ?? `${r.court_booked ?? '-'} ${r.slot}`}`
-      );
+    onAccountSettled: (i, r) => {
+      console.log(formatResultLine(r));
+      reporter.settle(i, r);
     },
   });
+  reporter.write(engine);
 
   console.log(`\n=== results (engine total ${engine.total_ms}ms) ===`);
   let errors = 0;

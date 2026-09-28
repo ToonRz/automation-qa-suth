@@ -228,12 +228,12 @@ Audit `bot.stdout.log` ช่วง 2026-09-01 ถึง 2026-09-28 (โค้�
 - [x] C-5 commit `fix(engine): arm outage alert before browser launch`
 
 ### D — report
-- [ ] D-1 ขยาย `EngineResult` (`fired_at`, `drift_ms`, prewarm tallies, retry rounds)
-- [ ] D-2 เขียน `reports/bot-run-*.json` ใน `runScheduledBooking` ทุก exit path (try/catch, ไม่ throw)
-- [ ] D-3 log `[result]` ต่อบัญชีใน `onAccountSettled`
-- [ ] D-4 screenshot ลงโฟลเดอร์วันที่ (`baseFlowOptions` → `screenshotsDir/<date>`) + retention ตาม Q-D1
+- [x] D-1 ขยาย `EngineResult` (`fired_at`, `drift_ms`, prewarm tallies, retry rounds)
+- [x] D-2 เขียน `reports/bot-run-*.json` ใน `runScheduledBooking` ทุก exit path (try/catch, ไม่ throw)
+- [x] D-3 log `[result]` ต่อบัญชีใน `onAccountSettled`
+- [x] D-4 screenshot ลงโฟลเดอร์วันที่ (`baseFlowOptions` → `screenshotsDir/<date>`) + retention ตาม Q-D1
 - [ ] D-5 verify ด้วย `npm run rehearse` (นอกช่วง 11:50–12:05) + กรณี drift skip
-- [ ] D-6 commit `feat(bot): write §7 JSON report and per-account result log`
+- [x] D-6 commit `feat(bot): write §7 JSON report and per-account result log`
 
 ### A — Phase 3 bounds
 - [ ] A-1 `AbortController` ใน `setSelectionAndSubmitViaFetch`, `fetchAllReservedTimes`, `verifyBookedOnReservations`

@@ -44,11 +44,12 @@ import {
 import { getCourtId, updateCourtIds } from '../courtIdCache';
 import { waitUntilLocalTimestamp } from '../localClock';
 import { COURTS } from './configLoader';
+import { bangkokDate, screenshotsBaseDir } from './runReport';
 import { sendTelegramMessage } from './telegramSend';
 import { getOwner } from './userStore';
+import * as path from 'path';
 
 const LOGIN_URL = 'https://susport.sc.su.ac.th/login.php';
-const SCREENSHOTS_DIR = '/app/screenshots'; // overridden via env in deploy
 
 /** How many ms BEFORE targetTime the prewarm fires. Read lazily so callers
  *  (rehearse) can set PREWARM_LEAD_SEC before the first call, not before
@@ -151,10 +152,25 @@ interface PrewarmedAccount {
   error?: string;
 }
 
+/** Prewarm state the dispatch was built from (§7 report). */
+export interface PrewarmTallies {
+  page_ready: number;
+  login_ready: number;
+  needs_standard: number;
+  failed: number;
+  retry_rounds: number;
+}
+
 export interface EngineResult {
   results: BookingResult[];
   mode: 'prewarm' | 'standard';
   total_ms: number;
+  /** When the dispatch started (the tick, or the drift-guard SKIP decision). */
+  fired_at: string;
+  /** fired_at − target; null when the engine was given no target (runStandard). */
+  drift_ms: number | null;
+  /** Prewarm tallies at dispatch; null for runStandard. */
+  prewarm: PrewarmTallies | null;
 }
 
 export interface BatchOptions {
@@ -171,11 +187,13 @@ async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-function baseFlowOptions(browser: Browser, opts: BatchOptions): FlowOptions {
+/** Screenshots go to `<SCREENSHOTS_DIR>/<YYYY-MM-DD>/` (Bangkok date of
+ *  `runDate`), so one day's `<username>.png` no longer overwrites the last. */
+function baseFlowOptions(browser: Browser, opts: BatchOptions, runDate: Date): FlowOptions {
   return {
     browser,
     courtPriority: COURTS,
-    screenshotsDir: process.env.SCREENSHOTS_DIR ?? SCREENSHOTS_DIR,
+    screenshotsDir: path.join(screenshotsBaseDir(), bangkokDate(runDate)),
     dryRun: opts.dryRun,
   };
 }
@@ -280,6 +298,17 @@ function tallies(entries: PrewarmedAccount[]): string {
     `${count('page-ready')} page-ready / ${count('login-ready')} login-ready / ` +
     `${count('needs-standard')} needs-standard / ${count('failed')} failed`
   );
+}
+
+function tallyCounts(entries: PrewarmedAccount[], retryRounds: number): PrewarmTallies {
+  const count = (s: PrewarmStatus): number => entries.filter((e) => e.status === s).length;
+  return {
+    page_ready: count('page-ready'),
+    login_ready: count('login-ready'),
+    needs_standard: count('needs-standard'),
+    failed: count('failed'),
+    retry_rounds: retryRounds,
+  };
 }
 
 /** One entry per account, all 'failed', created BEFORE any prewarm runs.
@@ -433,11 +462,13 @@ export async function runStandard(
   // Same-slot de-confliction applies here too: each account walks the court
   // list from its own rotated starting point.
   const rotations = computeSlotRotations(accounts);
+  const flowBase = baseFlowOptions(browser, opts, new Date());
   try {
+    const firedAt = new Date();
     const results = await Promise.all(
       accounts.map((account, i) =>
         bookOneAccount(account, {
-          ...baseFlowOptions(browser, opts),
+          ...flowBase,
           courtPriority: rotateCourts(COURTS, rotations[i]),
         }).then((r) => {
           try {
@@ -449,7 +480,14 @@ export async function runStandard(
         })
       )
     );
-    return { results, mode: 'standard', total_ms: Date.now() - start };
+    return {
+      results,
+      mode: 'standard',
+      total_ms: Date.now() - start,
+      fired_at: firedAt.toISOString(),
+      drift_ms: null,
+      prewarm: null,
+    };
   } finally {
     // Accounts closed their own contexts (they own them on the standard
     // path); only the shared browser remains — detached, timed.
@@ -555,6 +593,7 @@ export async function runPrewarmedBatch(
     // Phase 1b: retry transient failures until T-RETRY_STOP_BEFORE_MS.
     // Only 'failed' retries — login-ready/needs-standard are deterministic
     // states, not errors (retrying them re-does work for the same answer).
+    let retryRounds = 0;
     while (entries.some((e) => e.status === 'failed') && Date.now() < retryDeadline) {
       const wait = Math.min(RETRY_INTERVAL_MS, retryDeadline - Date.now());
       if (wait <= 0) break;
@@ -564,6 +603,7 @@ export async function runPrewarmedBatch(
         .map((e, i) => (e.status === 'failed' ? i : -1))
         .filter((i) => i >= 0);
       console.log(`[bookingEngine] prewarm retry for ${failedIdx.length} failed account(s)`);
+      retryRounds += 1;
       await prewarmRound(browser, entries, priorities, failedIdx, roundDeadline(retryDeadline));
       console.log(`[bookingEngine] prewarm after retry: ${tallies(entries)}`);
     }
@@ -629,6 +669,9 @@ export async function runPrewarmedBatch(
           })
           .join(' ')
     );
+    // Shared flow options (incl. the dated screenshot folder) — built before
+    // the tick so the dispatch loop does no extra work.
+    const flowBase = baseFlowOptions(browser, opts, targetTime);
 
     // Phase 2: the exact local tick (SC-01/SC-04).
     await waitUntilLocalTimestamp(targetTime.getTime());
@@ -658,7 +701,14 @@ export async function runPrewarmedBatch(
           /* ignore */
         }
       });
-      return { results: missResults, mode: 'prewarm', total_ms: Date.now() - start };
+      return {
+        results: missResults,
+        mode: 'prewarm',
+        total_ms: Date.now() - start,
+        fired_at: firedAt.toISOString(),
+        drift_ms: driftMs,
+        prewarm: tallyCounts(entries, retryRounds),
+      };
     }
 
     console.log(
@@ -670,7 +720,7 @@ export async function runPrewarmedBatch(
     const results = await Promise.all(
       entries.map((e, i) => {
         const plan = dispatchPlan[i];
-        const base = { ...baseFlowOptions(browser, opts), courtPriority: plan.priority };
+        const base = { ...flowBase, courtPriority: plan.priority };
         let p: Promise<BookingResult>;
         if (e.status === 'page-ready' && e.page) {
           p = bookOneAccount(e.account, {
@@ -695,7 +745,14 @@ export async function runPrewarmedBatch(
       })
     );
 
-    return { results, mode: 'prewarm', total_ms: Date.now() - start };
+    return {
+      results,
+      mode: 'prewarm',
+      total_ms: Date.now() - start,
+      fired_at: firedAt.toISOString(),
+      drift_ms: driftMs,
+      prewarm: tallyCounts(entries, retryRounds),
+    };
   } finally {
     if (outageTimer) clearTimeout(outageTimer);
     // Detached teardown — results/DMs never wait on Chrome shutdown.
