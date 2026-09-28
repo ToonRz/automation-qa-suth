@@ -505,8 +505,11 @@ function assertS7(accounts: BookingResult[], n: number): void {
 
 /** Invariants of a healthy run that the new bounds must never disturb. */
 function assertUntouchedNormalRun(): void {
-  const bad = h.lines.filter((l) => /timeout|did not settle|result-late/i.test(l.text));
-  assert.deepEqual(bad.map((l) => l.text), [], 'no timeout / late lines on a healthy run');
+  const bad = h.lines.filter((l) =>
+    /timeout|did not settle|result-late|round CUT|fresh browser/i.test(l.text)
+  );
+  assert.deepEqual(bad.map((l) => l.text), [], 'no timeout / late / CUT / fresh-browser lines');
+  assert.equal(h.launches.length, 1, 'one browser launch');
 }
 
 /** Freeze pages + HTTP just before the tick; release `releaseAfterMs` after it. */
@@ -804,6 +807,83 @@ const scenarios: Scenario[] = [
       const lateCtx = h.contexts.filter((c) => c.createdAt >= firedAt + 20_000);
       assert.equal(lateCtx.length, 2, 'both late contexts were created after the release');
       assert.ok(lateCtx.every((c) => c.closeCalls === 1), 'each late context closed exactly once');
+    },
+  },
+  {
+    name: 'b-cut',
+    about: 'B: login.php hangs → round 2 is CUT, its contexts closed ≤1s after the CUT, one close per round per account; all failed → fresh browser used by Phase 3',
+    run: async () => {
+      h.mock.plan.login = 'hang';
+      process.env.PREWARM_LEAD_SEC = '100';
+      const target = new Date(Date.now() + 100_000);
+      const { settled, onAccountSettled } = collectSettled();
+      const res = await engine.runPrewarmedBatch(mockAccounts(3), target, {
+        onAccountSettled,
+        suppressAlerts: true,
+      });
+      const firedAt = Date.parse(res.fired_at);
+
+      const cuts = h.find(/prewarm round CUT — cancelled 3 in-flight context\(s\)$/);
+      assert.equal(cuts.length, 1, 'the second round was cut with 3 contexts in flight');
+      assert.equal(h.find(/prewarm retry for 3 failed/).length, 1, 'two rounds in total');
+      const cutAt = cuts[0].at;
+      const prewarmCtx = h.contexts.filter((c) => c.browser === 0);
+      assert.equal(prewarmCtx.length, 6, '3 accounts × 2 rounds of prewarm contexts');
+      assert.ok(prewarmCtx.every((c) => c.closeCalls === 1), 'every prewarm context closed exactly once');
+      const cutRound = prewarmCtx.filter((c) => c.createdAt < cutAt && c.createdAt > cutAt - 15_000);
+      assert.equal(cutRound.length, 3, 'three contexts belong to the cut round');
+      for (const c of cutRound) {
+        const lag = (c.closeCalledAt ?? Infinity) - cutAt;
+        assert.ok(lag >= 0 && lag <= 1_000, `cut-round context closed ${lag}ms after the CUT`);
+      }
+      for (const n of [1, 2, 3]) {
+        const closes = h.find(new RegExp(`\\[cleanup\\] prewarm ctx mock-u${n} close`));
+        assert.equal(closes.length, 2, `mock-u${n}: one prewarm close per round`);
+      }
+
+      const fresh = h.find(/\[bookingEngine\] fresh browser for standard path \(launch=\d+ms\)/);
+      assert.equal(fresh.length, 1, 'fresh browser launched');
+      assert.ok(fresh[0].at < firedAt, 'fresh browser ready before the tick');
+      assert.equal(h.launches.length, 2);
+      const phase3 = h.contexts.filter((c) => c.createdAt >= firedAt);
+      assert.equal(phase3.length, 3, 'three standard-path contexts at the tick');
+      assert.ok(phase3.every((c) => c.browser === 1), 'Phase 3 ran on the fresh browser');
+      assert.equal(settled.length, 3);
+      await h.waitFor(/browser \(fresh\) close(=| hung)/, 40_000);
+      await h.waitFor(/browser \(batch\) close(=| hung)/, 40_000);
+    },
+  },
+  {
+    name: 'b-opening',
+    about: 'B: newContext() still pending when the round is CUT → context closed on arrival; Phase 3 books on the fresh browser',
+    run: async () => {
+      process.env.PREWARM_LEAD_SEC = '50';
+      const target = new Date(Date.now() + 50_000);
+      h.newContextFrozen = true;
+      setTimeout(() => h.releaseContexts(), target.getTime() - Date.now() - 35_000);
+      const { settled, onAccountSettled } = collectSettled();
+      const res = await engine.runPrewarmedBatch(mockAccounts(3), target, {
+        onAccountSettled,
+        suppressAlerts: true,
+      });
+      assert.equal(
+        h.find(/prewarm round CUT — cancelled 0 in-flight context\(s\), 3 still opening \(closed on arrival\)/).length,
+        1
+      );
+      const prewarmCtx = h.contexts.filter((c) => c.browser === 0);
+      assert.equal(prewarmCtx.length, 3, 'the three held contexts arrived after the release');
+      for (const c of prewarmCtx) {
+        const lag = (c.closeCalledAt ?? Infinity) - c.createdAt;
+        assert.ok(c.closeCalls === 1 && lag <= 1_000, `closed on arrival (${lag}ms)`);
+      }
+      assert.ok(h.has(/fresh browser for standard path/));
+      const firedAt = Date.parse(res.fired_at);
+      assert.ok(
+        h.contexts.filter((c) => c.createdAt >= firedAt).every((c) => c.browser === 1),
+        'Phase 3 ran on the fresh browser'
+      );
+      assert.deepEqual(res.results.map((r) => r.status), ['PASS', 'PASS', 'PASS']);
+      assert.equal(settled.length, 3);
     },
   },
 ];

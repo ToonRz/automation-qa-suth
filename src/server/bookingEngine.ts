@@ -90,6 +90,9 @@ function roundDeadline(retryDeadline: number): number {
   );
   return Math.min(now + budget, retryDeadline);
 }
+/** Launch ceiling for the fresh browser that replaces the prewarm one after
+ *  a total outage (B3). Never allowed to run past the tick either. */
+const FRESH_BROWSER_LAUNCH_TIMEOUT_MS = 20_000;
 /** How far before targetTime the total-outage DM fires. Armed on the WALL CLOCK
  *  rather than after Phase 1 — the run where this alert matters most is exactly
  *  the run where Phase 1 does not return in time to send it. */
@@ -278,21 +281,50 @@ function baseFlowOptions(browser: Browser, opts: BatchOptions, runDate: Date): F
 }
 
 /**
+ * One account's in-flight prewarm, shared with prewarmRound so a round that
+ * is CUT can close the context right away. On 2026-09-15 cut rounds only
+ * dropped their results: 51 prewarm contexts kept running (or hanging) inside
+ * the one Chrome that Phase 3 then had to use, and took 18 minutes to close.
+ */
+interface PrewarmTicket {
+  username: string;
+  context: BrowserContext | null;
+  cancelled: boolean;
+  closeIssued: boolean;
+}
+
+/** Close a ticket's context — detached, timed, at most once. */
+function closeTicket(t: PrewarmTicket): void {
+  if (t.closeIssued || !t.context) return;
+  t.closeIssued = true;
+  const ctx = t.context;
+  void closeWithTiming(`prewarm ctx ${t.username}`, () => ctx.close());
+}
+
+/**
  * Prewarm ONE account: fresh context → login → booking.php → try to
  * pre-select (court, slot). Never throws; failures are encoded in `status`.
  *
  * `priority` is this account's ROTATED court list (de-confliction) — the
  * pre-select targets its first open entry, so same-slot accounts pre-select
  * different courts whenever the stale data allows it.
+ *
+ * The context is registered on `ticket` the moment it exists. If the round
+ * is cut, prewarmRound closes it, and whatever this function is awaiting
+ * throws into the catch below (the result is dropped anyway).
  */
 async function prewarmOne(
   browser: Browser,
   account: Account,
-  priority: string[]
+  priority: string[],
+  ticket: PrewarmTicket
 ): Promise<PrewarmedAccount> {
   let context: BrowserContext | null = null;
   try {
     context = await browser.newContext({ storageState: undefined });
+    ticket.context = context;
+    // Round cut while newContext was still pending — close it on arrival.
+    if (ticket.cancelled) throw new Error('prewarm round cut before the context opened');
     const page = await context.newPage();
     await page.goto(LOGIN_URL, { waitUntil: 'domcontentloaded', timeout: 20000 });
     await page.locator('input[name="username"]').fill(account.username);
@@ -362,11 +394,9 @@ async function prewarmOne(
     // enough — on 2026-08-31 the 17 bounded closes serialized on the one CDP
     // pipe and cost ~10 minutes anyway, because this path AWAITED them. The
     // context is dead and this account's outcome is already decided, so nothing
-    // here needs the close to finish: fire it and return.
-    if (context) {
-      const ctx = context;
-      void closeWithTiming(`prewarm ctx ${account.username}`, () => ctx.close());
-    }
+    // here needs the close to finish: fire it and return. (No-op when a round
+    // cut already closed it.)
+    closeTicket(ticket);
     return { account, context: null, page: null, status: 'failed', error: message.split('\n')[0] };
   }
 }
@@ -412,7 +442,12 @@ function pendingEntries(accounts: Account[]): PrewarmedAccount[] {
  *
  * Late arrivals are DROPPED, not merged: once the round is sealed the dispatch
  * plan may already be built from `entries`, and swapping a live page in behind
- * it would race the tick. Their contexts are closed detached so nothing leaks.
+ * it would race the tick.
+ *
+ * Sealing a cut round closes every unsettled account's context immediately
+ * (detached) — before this returns, so the next retry round never starts
+ * while the previous one's contexts are still open. A context whose
+ * newContext() is still pending is closed the moment it arrives.
  *
  * Returns true when every account settled inside the budget.
  */
@@ -425,17 +460,22 @@ async function prewarmRound(
 ): Promise<boolean> {
   let sealed = false;
   let settled = 0;
-  const tasks = idx.map((i) =>
-    prewarmOne(browser, entries[i].account, priorities[i]).then((r) => {
+  const done = idx.map(() => false);
+  const tickets: PrewarmTicket[] = idx.map((i) => ({
+    username: entries[i].account.username,
+    context: null,
+    cancelled: false,
+    closeIssued: false,
+  }));
+  const tasks = idx.map((i, k) =>
+    prewarmOne(browser, entries[i].account, priorities[i], tickets[k]).then((r) => {
       if (sealed) {
-        const late = r.context;
-        if (late) {
-          void closeWithTiming(`late prewarm ctx ${r.account.username}`, () => late.close());
-        }
+        closeTicket(tickets[k]); // late arrival — its context is closed (once)
         return;
       }
       entries[i] = r;
       settled += 1;
+      done[k] = true;
     })
   );
   const complete = await Promise.race([
@@ -447,6 +487,22 @@ async function prewarmRound(
     console.warn(
       `[bookingEngine] prewarm round CUT at deadline — ${settled}/${idx.length} settled, ` +
         `${idx.length - settled} left failed for the standard path`
+    );
+    let cancelled = 0;
+    let opening = 0;
+    tickets.forEach((t, k) => {
+      if (done[k]) return;
+      t.cancelled = true;
+      if (t.context) {
+        closeTicket(t);
+        cancelled += 1;
+      } else {
+        opening += 1;
+      }
+    });
+    console.warn(
+      `[bookingEngine] prewarm round CUT — cancelled ${cancelled} in-flight context(s)` +
+        (opening > 0 ? `, ${opening} still opening (closed on arrival)` : '')
     );
   }
   return complete;
@@ -516,8 +572,10 @@ async function sendPrewarmOutageAlert(
   await sendTelegramMessage(owner.chat_id, text);
 }
 
-/** Detached teardown with per-step timing. Never awaited by callers. */
-async function cleanupBatch(entries: PrewarmedAccount[], browser: Browser): Promise<void> {
+/** Detached teardown with per-step timing. Never awaited by callers.
+ *  Closes every browser the batch launched — the prewarm one and, after a
+ *  total outage, the fresh one Phase 3 used. */
+async function cleanupBatch(entries: PrewarmedAccount[], browsers: Browser[]): Promise<void> {
   const t0 = Date.now();
   for (const e of entries) {
     if (!e.context) continue;
@@ -526,8 +584,46 @@ async function cleanupBatch(entries: PrewarmedAccount[], browser: Browser): Prom
     e.context = null;
     e.page = null;
   }
-  await closeWithTiming('browser (batch)', () => browser.close());
+  await Promise.all(
+    browsers.map((b, i) =>
+      closeWithTiming(i === 0 ? 'browser (batch)' : 'browser (fresh)', () => b.close())
+    )
+  );
   console.log(`[cleanup] batch teardown total=${Date.now() - t0}ms`);
+}
+
+/**
+ * Launch a replacement browser for Phase 3, bounded by `budgetMs`. Returns
+ * null (caller keeps the old browser) on failure or timeout; a browser that
+ * finishes launching after we gave up is closed on arrival.
+ */
+async function launchFreshBrowser(budgetMs: number): Promise<Browser | null> {
+  const t0 = Date.now();
+  const launching = chromium.launch({ channel: 'chrome', headless: true });
+  let timer: NodeJS.Timeout | undefined;
+  const timedOut = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), budgetMs);
+  });
+  try {
+    const fresh = await Promise.race([launching, timedOut]);
+    if (fresh) {
+      console.log(`[bookingEngine] fresh browser for standard path (launch=${Date.now() - t0}ms)`);
+      return fresh;
+    }
+    console.warn(
+      `[bookingEngine] fresh browser launch did not finish in ${budgetMs}ms — keeping the old browser`
+    );
+    launching.then(
+      (late) => void closeWithTiming('browser (late fresh)', () => late.close()),
+      () => {}
+    );
+    return null;
+  } catch (err) {
+    console.warn(`[bookingEngine] fresh browser launch failed (${err}) — keeping the old browser`);
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 /** Standard parallel run — full login per account at call time, no prewarm.
@@ -632,12 +728,12 @@ export async function runPrewarmedBatch(
     outageTimer.unref?.();
   }
 
-  let launched: Browser | undefined;
+  const browsers: Browser[] = []; // every browser this batch launched
   let dispatched: Promise<BookingResult>[] = [];
   try {
     const tLaunch = Date.now();
-    const browser = await chromium.launch({ channel: 'chrome', headless: true });
-    launched = browser;
+    let browser = await chromium.launch({ channel: 'chrome', headless: true });
+    browsers.push(browser);
     console.log(`[perf] browser launch=${Date.now() - tLaunch}ms`);
 
     // Phase 0: sleep until the prewarm window opens.
@@ -693,6 +789,27 @@ export async function runPrewarmedBatch(
       retryRounds += 1;
       await prewarmRound(browser, entries, priorities, failedIdx, roundDeadline(retryDeadline));
       console.log(`[bookingEngine] prewarm after retry: ${tallies(entries)}`);
+    }
+
+    // Phase 1b': still a total outage after the retry window (T-40s). The
+    // prewarm browser may be the thing that is broken (2026-09-15: Phase 3
+    // ran in the same Chrome as 68 stuck contexts), and every account is
+    // going to the standard path anyway — give Phase 3 a fresh browser. The
+    // old one is closed with the batch (detached). Bounded so it can never
+    // push the dispatch past the tick; on failure the old browser is used.
+    if (entries.length > 0 && entries.every((e) => e.status === 'failed')) {
+      const budgetMs = Math.min(FRESH_BROWSER_LAUNCH_TIMEOUT_MS, targetTime.getTime() - Date.now());
+      if (budgetMs <= 0) {
+        console.warn(
+          '[bookingEngine] total outage but no time left before the tick — keeping the old browser'
+        );
+      } else {
+        const fresh = await launchFreshBrowser(budgetMs);
+        if (fresh) {
+          browsers.push(fresh);
+          browser = fresh;
+        }
+      }
     }
 
     // Phase 1c: informational heads-up (pre-reset data — changes NOTHING).
@@ -846,10 +963,9 @@ export async function runPrewarmedBatch(
   } finally {
     if (outageTimer) clearTimeout(outageTimer);
     // Detached teardown — results/DMs never wait on Chrome shutdown.
-    if (launched) {
-      const b = launched;
+    if (browsers.length > 0) {
       afterInFlight(dispatched, () =>
-        void cleanupBatch(entries, b).catch((err) =>
+        void cleanupBatch(entries, browsers).catch((err) =>
           console.warn(`[bookingEngine] detached cleanup error: ${err}`)
         )
       );

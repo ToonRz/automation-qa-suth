@@ -245,11 +245,11 @@ Audit `bot.stdout.log` ช่วง 2026-09-01 ถึง 2026-09-28 (โค้�
 - [x] A-7 commit `fix(engine): bound phase-3 per-account time and in-page fetches`
 
 ### B — cancel cut rounds / fresh browser
-- [ ] B-1 registry context ใน `prewarmOne` + ปิด in-flight ตอน seal ใน `prewarmRound`
-- [ ] B-2 fresh browser ก่อน tick เมื่อ all-failed (race launch 20s, fallback ตัวเก่า)
-- [ ] B-3 `cleanupBatch` ปิดทั้ง 2 browser
-- [ ] B-4 test: mock ค้าง login.php → นับบรรทัด close ต่อรอบ, เวลา close หลัง CUT
-- [ ] B-5 commit `fix(engine): cancel in-flight prewarm on round cut, fresh browser after total outage`
+- [x] B-1 registry context ใน `prewarmOne` + ปิด in-flight ตอน seal ใน `prewarmRound`
+- [x] B-2 fresh browser ก่อน tick เมื่อ all-failed (race launch 20s, fallback ตัวเก่า)
+- [x] B-3 `cleanupBatch` ปิดทั้ง 2 browser
+- [x] B-4 test: mock ค้าง login.php → นับบรรทัด close ต่อรอบ, เวลา close หลัง CUT
+- [x] B-5 commit `fix(engine): cancel in-flight prewarm on round cut, fresh browser after total outage`
 
 ### E — missed-run watchdog
 - [ ] E-1 `config/run-state.json` read/write (atomic tmp+rename เหมือน `courtIdCache`) + เพิ่มใน `.gitignore`
