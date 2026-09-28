@@ -1,4 +1,4 @@
-# Handoff สำหรับ agent บนเครื่องที่ 2 (machine-2) — 2026-09-27
+# Handoff สำหรับ agent บนเครื่องที่ 2 (machine-2) — 2026-09-27 (อัปเดต 2026-09-28)
 
 > อ่านทั้งไฟล์ก่อนลงมือ. กฎของ repo (CLAUDE.md): **ทุกการแก้ต้องอิง `requirements.md` —
 > อะไรที่นอกเหนือ spec (tooling ใหม่, dependency ใหม่, behavior ใหม่) ให้ถาม user ก่อน.**
@@ -6,9 +6,11 @@
 
 ## อัปเดต 2026-09-28 — ต้อง pull ชุด fix จาก log audit
 
-ชุดนี้อยู่บน branch `fix/log-audit-2026-09-28` (spec: `doc/fix-plan-2026-09-28-log-audit.md`,
-บันทึกใน `requirements.md` §10.5–10.9). **รอ user merge เข้า `main` แล้ว push ก่อน** จากนั้นทำตาม
-"ขั้นที่ 0" ด้านล่าง (`git pull --ff-only origin main` → `npx tsc --noEmit`; ไม่มี dependency ใหม่).
+ชุดนี้ **merge เข้า `main` และ push แล้ว** (`origin/main` = `06c2397`; spec:
+`doc/fix-plan-2026-09-28-log-audit.md`, บันทึกใน `requirements.md` §10.5–10.9). เครื่องที่ 1 restart
+บอทบนโค้ดนี้แล้วเมื่อ 28/09 14:10. เครื่องนี้ให้ทำตาม "ขั้นที่ 0" ด้านล่าง
+(`git pull --ff-only origin main` → `npx tsc --noEmit`; ไม่มี dependency ใหม่) แล้วเช็ค `config/`
+ตามหัวข้อถัดไป **ก่อน** restart.
 
 Commit ในชุด:
 - `fix(engine): arm outage alert before browser launch` (C)
@@ -29,6 +31,45 @@ Commit ในชุด:
   `round CUT`, `fresh browser` ในรอบปกติ.
 - ทดสอบได้ด้วย `npm run test:log-audit` (~15 นาที; mock server + Chrome จริง ไม่แตะเว็บจริง/Telegram).
 
+## `config/` ของเครื่องนี้ — ใช้ account เดิม ห้ามเปลี่ยน
+
+**เครื่องนี้เคย pull และตั้ง account ไว้แล้ว** (19 บัญชี ของบอทเครื่องนี้). ให้ใช้ของเดิมทั้งหมด:
+- **ห้ามเปลี่ยน / ลบ / แทนที่** user, chat id, username, password, slot ที่มีอยู่ และ**ห้าม copy**
+  `users.json` / `accounts.json` / `run-state.json` จากเครื่องที่ 1 มาทับ (ข้อมูลคนละชุด).
+- สิ่งที่ต้องทำคือให้ **format ของไฟล์ใน `config/` เหมือนเครื่องที่ 1** — โครงสร้าง/ชื่อ key เท่านั้น,
+  ค่าเดิมของเครื่องนี้คงไว้ทุกตัว.
+
+format ของเครื่องที่ 1 (ณ `06c2397`):
+
+| ไฟล์ | git | format | หมายเหตุ |
+|---|---|---|---|
+| `config/users.json` | ignored, `chmod 600` | `{ "users": [ { "telegram_id", "chat_id", "display_name", "role": "owner"\|"friend", "accounts": [ { "username", "password", "court", "slot" } ], "pending_booking"?, "cron_enabled"?, "last_result"? } ] }` | **บอทจองจากไฟล์นี้**. owner ได้คนเดียว. `court` เป็น field เก่า (ไม่ใช้แล้ว) แต่เครื่องที่ 1 ยังมี — คงไว้. 3 field ท้ายบอทเขียนเอง |
+| `config/accounts.json` | ignored | `{ "COURT_PRIORITY": [ ... ], "accounts": [ { "username", "password", "slot" } ] }` | ต้องมี `COURT_PRIORITY` ที่ไม่ว่าง ไม่งั้นบอท start ไม่ขึ้น. `accounts` ใช้เฉพาะโหมด CLI (`npm start` / `npm run account`) |
+| `config/court-ids.json` | **tracked** | `{ "แบดมินตันN": "<id>" }` | cache ที่บอทเขียนเองตอน prewarm/เที่ยง |
+| `config/run-state.json` | ignored | `{ "last_cron_fired_date"?, "last_dispatch_date"?, "missed_alert_date"? }` | **ใหม่** — บอทสร้างเอง ห้ามสร้าง/copy เอง |
+| `config/users.example.json` | tracked | ตัวอย่างของ `users.json` | |
+
+`COURT_PRIORITY` ของเครื่องที่ 1 ตอนนี้คือ
+`["แบดมินตัน3","แบดมินตัน2","แบดมินตัน1","แบดมินตัน4","แบดมินตัน5","แบดมินตัน6"]` — ถ้าของเครื่องนี้ต่างไป
+**อย่าแก้เอง** (เป็นลำดับการจอง ไม่ใช่ format) ให้ถาม user.
+
+เช็คโครงสร้าง (พิมพ์แค่ key/จำนวน — ห้ามพิมพ์ค่า):
+
+```bash
+ls -la config/
+node -e 'const j=require("./config/users.json");j.users.forEach((u,i)=>console.log(i,u.role,Object.keys(u).join(","),"accounts="+u.accounts.length,[...new Set(u.accounts.flatMap(a=>Object.keys(a)))].join(",")))'
+node -e 'const j=require("./config/accounts.json");console.log(Object.keys(j).join(","),"COURT_PRIORITY="+(j.COURT_PRIORITY||[]).length,"accounts="+(j.accounts||[]).length)'
+```
+
+- ตรงกับตารางแล้ว → ไม่ต้องแตะไฟล์.
+- ต่างจากตาราง → สำรองก่อน (`cp config/users.json config/users.json.bak-$(date +%Y%m%d)` — `*.bak*`
+  ถูก ignore), แก้**เฉพาะโครงสร้าง**โดยค่าเดิมครบทุกตัว, สรุปให้ user ดูว่าเปลี่ยน key อะไร
+  (ไม่แสดงค่า) และ**ขออนุมัติก่อนบันทึก**. ห้ามแก้ช่วง 11:50–12:15 (บอท snapshot รายชื่อตอน 11:55).
+- หลังแก้ `users.json`: `chmod 600 config/users.json` และจำนวนบัญชีต้องเท่าเดิม (19).
+- `git status` หลัง pull ถ้าเห็น ` M config/court-ids.json` = cache ที่บอทเครื่องนี้เขียนเอง (ไฟล์นี้ถูก track)
+  — แสดง `git diff config/court-ids.json` ให้ user ดูแล้วถามก่อนว่าจะเก็บของเครื่องนี้หรือเอาของ `main`
+  (อย่า stash/checkout ทิ้งเอง).
+
 ## บริบท
 
 - Repo: `ToonRz/automation-qa-suth` (**public**). เครื่องนี้รันบอท Telegram `David_Bot`
@@ -43,10 +84,11 @@ Commit ในชุด:
 
 ## ขั้นที่ 0 — อัปเดตเป็น `main` ล่าสุดก่อนแก้อะไรทั้งนั้น
 
-ทุกการ diagnose/แก้ในไฟล์นี้ต้องทำบนโค้ด `origin/main` ล่าสุด (อย่างน้อยต้องมี `2016eca`).
+ทุกการ diagnose/แก้ในไฟล์นี้ต้องทำบนโค้ด `origin/main` ล่าสุด (ต้องมี `06c2397`).
 
 ```bash
 git status --short                 # ต้องว่าง; ถ้ามีไฟล์ค้าง → หยุด แจ้ง user ก่อน (อย่า stash/ทิ้งเอง)
+                                   # (` M config/court-ids.json` = cache ของบอท — ดูหัวข้อ config ด้านบน)
 git switch main
 git fetch origin
 git log --oneline HEAD..origin/main    # สิ่งที่จะได้มาใหม่
@@ -72,7 +114,7 @@ git log origin/main --oneline -- .env.bak-predeep.20260701-150459 | head
 
 ```bash
 git log --oneline -1                                   # ควรเป็น origin/main ล่าสุด
-git merge-base --is-ancestor 2016eca HEAD && echo ok   # มี commit untrack ไฟล์ลับแล้ว
+git merge-base --is-ancestor 06c2397 HEAD && echo ok   # มีชุด fix log-audit (รวม 2016eca) แล้ว
 npm install
 npx tsc --noEmit                                       # ต้องผ่านก่อนไปต่อ
 ```
@@ -184,7 +226,8 @@ connect timeout แบบ `AggregateError` (IPv4/IPv6 ล้มหมด) ที
 
 ## ลำดับความสำคัญ
 
-1. ขั้นที่ 0 — อัปเดตเป็น `main` ล่าสุด (รวมการเช็ก rewrite ของปัญหา 3 ข้อ 1–2) ก่อนทำอย่างอื่น.
+1. ขั้นที่ 0 — อัปเดตเป็น `main` ล่าสุด (`06c2397`, รวมการเช็ก rewrite ของปัญหา 3 ข้อ 1–2) ก่อนทำอย่างอื่น.
+   แล้วเช็ค `config/` ตามหัวข้อ "ใช้ account เดิม ห้ามเปลี่ยน" ก่อน restart บอท.
 2. ปัญหา 1 diagnose (a)/(b) → รายงาน user → ขออนุมัติการแก้.
 3. ปัญหา 2 (เสนอเท่านั้น).
-4. ก่อนรอบเที่ยงถัดไป: บอทรันอยู่บนโค้ดที่มี `763f8db`, เครื่องไม่ sleep, `curl` ไป susport ผ่าน.
+4. ก่อนรอบเที่ยงถัดไป: บอทรันอยู่บนโค้ดที่มี `06c2397`, เครื่องไม่ sleep, `curl` ไป susport ผ่าน.
