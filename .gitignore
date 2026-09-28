@@ -24,6 +24,8 @@ accounts.local.json
 config/accounts.json
 config/users.json
 config/*.local.json
+# Missed-noon watchdog state (src/server/runState.ts)
+config/run-state.json
 
 # IDE
 .vscode/

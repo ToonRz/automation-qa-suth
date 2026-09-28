@@ -39,6 +39,7 @@ const telegramSend = require('./telegramSend') as typeof import('./telegramSend'
 const userStore = require('./userStore') as typeof import('./userStore');
 const engine = require('./bookingEngine') as typeof import('./bookingEngine');
 const runReport = require('./runReport') as typeof import('./runReport');
+let runState = require('./runState') as typeof import('./runState');
 /* eslint-enable @typescript-eslint/no-var-requires */
 
 const SITE = 'https://susport.sc.su.ac.th';
@@ -615,7 +616,13 @@ const scenarios: Scenario[] = [
       process.env.PREWARM_LEAD_SEC = '45';
       const target = new Date(Date.now() + 45_000);
       const { reporter, settled, onAccountSettled } = botWiring(target, 3);
-      const res = await engine.runPrewarmedBatch(mockAccounts(3), target, { onAccountSettled });
+      const dispatches: { skipped: boolean; drift_ms: number | null }[] = [];
+      const res = await engine.runPrewarmedBatch(mockAccounts(3), target, {
+        onAccountSettled,
+        onDispatched: (info) => dispatches.push(info),
+      });
+      assert.equal(dispatches.length, 1, 'dispatch recorded once');
+      assert.equal(dispatches[0].skipped, false);
       const report = readReport(reporter.write(res));
 
       assertS7(report.accounts, 3);
@@ -655,11 +662,14 @@ const scenarios: Scenario[] = [
     run: async () => {
       const target = new Date(Date.now() - 35_000);
       const { reporter, onAccountSettled } = botWiring(target, 3);
+      const dispatches: { skipped: boolean }[] = [];
       const res = await engine.runPrewarmedBatch(mockAccounts(3), target, {
         onAccountSettled,
         suppressAlerts: true,
+        onDispatched: (info) => dispatches.push(info),
       });
       assert.ok(h.has(/dispatch SKIPPED/), 'drift guard skipped the dispatch');
+      assert.deepEqual(dispatches.map((d) => d.skipped), [true], 'SKIPPED counts as dispatched (E3)');
       const report = readReport(reporter.write(res));
       assertS7(report.accounts, 3);
       for (const a of report.accounts) {
@@ -884,6 +894,74 @@ const scenarios: Scenario[] = [
       );
       assert.deepEqual(res.results.map((r) => r.status), ['PASS', 'PASS', 'PASS']);
       assert.equal(settled.length, 3);
+    },
+  },  {
+    name: 'e-watchdog',
+    about: 'E: yesterday\'s state after 12:05 → 1 DM, restart → no repeat; no cron user / before 12:05 / dispatched → none',
+    run: async () => {
+      const file = process.env.RUN_STATE_PATH!;
+      const today = runReport.bangkokDate(new Date());
+      const yesterday = daysAgo(1);
+      const at = (hhmm: string, date = today): Date => new Date(`${date}T${hhmm}:00+07:00`);
+      const sent: string[] = [];
+      const send = async (text: string): Promise<void> => {
+        sent.push(text);
+      };
+      const restart = (): void => {
+        delete require.cache[require.resolve('./runState')];
+        runState = require('./runState');
+      };
+      const check = (hhmm: string, shouldRun = true, date = today) =>
+        runState.checkMissedNoon({ shouldRunToday: () => shouldRun, send, now: at(hhmm, date) });
+
+      // First start of this version, after 12:05, no state file: seed, no alert.
+      fs.rmSync(file, { force: true });
+      assert.equal(await check('14:00'), false);
+      assert.equal(runState.readRunState()?.missed_alert_date, today, 'seeded as handled');
+      assert.equal(sent.length, 0);
+
+      // The spec case: last dispatch yesterday.
+      fs.writeFileSync(
+        file,
+        JSON.stringify({ last_cron_fired_date: yesterday, last_dispatch_date: yesterday })
+      );
+      assert.equal(await check('12:04'), false, 'not before 12:05');
+      assert.equal(await check('12:30', false), false, 'no user with cron on → no alert');
+      assert.equal(await check('12:31'), true, 'alert after 12:05');
+      assert.equal(sent.length, 1);
+      assert.equal(
+        sent[0],
+        '⚠️ พลาดรอบ 12:00 วันนี้ — bot ไม่ได้ยิง (เครื่องหลับ/ปิดอยู่ช่วง 11:55–12:00?) ตื่นมาเวลา 12:31'
+      );
+      assert.ok(h.has(/\[watchdog\] missed noon run/));
+      restart();
+      assert.equal(await check('12:32'), false, 'restart → no second alert today');
+      assert.equal(await check('23:59'), false);
+      assert.equal(sent.length, 1);
+
+      // A Telegram failure is retried on the next check (not marked as sent).
+      fs.writeFileSync(file, JSON.stringify({ last_dispatch_date: yesterday }));
+      await assert.rejects(
+        runState.checkMissedNoon({
+          shouldRunToday: () => true,
+          send: async () => {
+            throw new Error('telegram down');
+          },
+          now: at('12:10'),
+        })
+      );
+      assert.equal(await check('12:11'), true, 'retried after the failed send');
+
+      // Normal day: cron + dispatch recorded today → silent.
+      fs.writeFileSync(file, JSON.stringify({ last_dispatch_date: yesterday }));
+      runState.recordCronFired(at('11:55'));
+      runState.recordDispatch(at('12:00'));
+      const st = runState.readRunState();
+      assert.equal(st?.last_cron_fired_date, today);
+      assert.equal(st?.last_dispatch_date, today);
+      const before = sent.length;
+      assert.equal(await check('12:06'), false, 'dispatched today → no alert');
+      assert.equal(sent.length, before);
     },
   },
 ];

@@ -195,6 +195,21 @@ export interface BatchOptions {
    *  ERROR via onAccountSettled; this receives its real result once the
    *  booking finally finishes (report only — no second DM). */
   onAccountLate?: (index: number, result: BookingResult) => void;
+  /** Called once the dispatch has happened — right after every submit is in
+   *  flight, or at the drift-guard SKIP (which counts as dispatched: the
+   *  users get a missed-deadline result). Never before a submit. */
+  onDispatched?: (info: { fired_at: string; drift_ms: number | null; skipped: boolean }) => void;
+}
+
+function notifyDispatched(
+  opts: BatchOptions,
+  info: { fired_at: string; drift_ms: number | null; skipped: boolean }
+): void {
+  try {
+    opts.onDispatched?.(info);
+  } catch {
+    /* callback errors must not affect the batch */
+  }
 }
 
 /**
@@ -645,6 +660,7 @@ export async function runStandard(
     dispatched = accounts.map((account, i) =>
       bookOneAccount(account, { ...flowBase, courtPriority: priorities[i] })
     );
+    notifyDispatched(opts, { fired_at: firedAt.toISOString(), drift_ms: null, skipped: false });
     const results = await Promise.all(
       dispatched.map((p, i) =>
         settleWithinBudget(p, accounts[i], priorities[i][0] ?? '', (late) =>
@@ -898,6 +914,7 @@ export async function runPrewarmedBatch(
         duration_ms: 0,
         attempts: [],
       }));
+      notifyDispatched(opts, { fired_at: firedAt.toISOString(), drift_ms: driftMs, skipped: true });
       missResults.forEach((r, i) => {
         try {
           opts.onAccountSettled?.(i, r);
@@ -936,7 +953,9 @@ export async function runPrewarmedBatch(
       }
       return bookOneAccount(e.account, base);
     });
-    // Every submit is in flight — only now arm the per-account budgets.
+    // Every submit is in flight — only now record the dispatch and arm the
+    // per-account budgets.
+    notifyDispatched(opts, { fired_at: firedAt.toISOString(), drift_ms: driftMs, skipped: false });
     const results = await Promise.all(
       dispatched.map((p, i) =>
         settleWithinBudget(p, entries[i].account, dispatchPlan[i].priority[0] ?? '', (late) =>

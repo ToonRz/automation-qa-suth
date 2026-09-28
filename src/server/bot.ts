@@ -51,6 +51,7 @@ import { runPrewarmedBatch, runStandard } from './bookingEngine';
 import type { EngineResult } from './bookingEngine';
 import type { BookingResult } from '../bookingFlow';
 import { createRunReporter, formatResultLine } from './runReport';
+import { checkMissedNoon, recordCronFired, recordDispatch } from './runState';
 import { waitUntilLocalTimestamp } from '../localClock';
 import { sendTelegramMessage } from './telegramSend';
 
@@ -1478,11 +1479,19 @@ async function runScheduledBooking(): Promise<void> {
   let engine: EngineResult;
   try {
     if (usePrewarm) {
-      engine = await runPrewarmedBatch(flat, fireTime, { onAccountSettled, onAccountLate });
+      engine = await runPrewarmedBatch(flat, fireTime, {
+        onAccountSettled,
+        onAccountLate,
+        onDispatched: () => recordDispatch(),
+      });
     } else {
       console.log('[scheduler] DEEP_PREWARM=0 — standard mode (no prewarm), waiting for tick');
       await waitUntilLocalTimestamp(fireTime.getTime());
-      engine = await runStandard(flat, { onAccountSettled, onAccountLate });
+      engine = await runStandard(flat, {
+        onAccountSettled,
+        onAccountLate,
+        onDispatched: () => recordDispatch(),
+      });
     }
   } catch (err) {
     console.error(`[scheduler] booking batch failed: ${err}`);
@@ -1518,6 +1527,44 @@ async function runScheduledBooking(): Promise<void> {
   }
 }
 
+// ---- Missed-noon watchdog (see runState.ts) ----
+
+const WATCHDOG_INTERVAL_MS = 60_000;
+/** True from the 11:55 cron fire until runScheduledBooking returns. A run
+ *  that is late but alive (e.g. the Mac woke at 12:10 and the drift guard is
+ *  about to SKIP) must not be reported as missed. */
+let runInProgress = false;
+let watchdogBusy = false;
+
+async function watchdogTick(): Promise<void> {
+  if (runInProgress || watchdogBusy) return;
+  watchdogBusy = true;
+  try {
+    await checkMissedNoon({
+      shouldRunToday: () =>
+        getAllUsers().some((u) => isCronEnabled(u.chat_id) && u.accounts.length > 0),
+      send: async (text) => {
+        const owner = getOwner();
+        if (!owner) {
+          console.warn('[watchdog] no owner to alert');
+          return;
+        }
+        await sendTelegramMessage(owner.chat_id, text);
+      },
+    });
+  } catch (err) {
+    console.warn(`[watchdog] check failed (retrying next minute): ${err}`);
+  } finally {
+    watchdogBusy = false;
+  }
+}
+
+/** Check at start (the Mac may just have woken up) and every minute after. */
+function startMissedRunWatchdog(): void {
+  void watchdogTick();
+  setInterval(() => void watchdogTick(), WATCHDOG_INTERVAL_MS);
+}
+
 // ---- Launch ----
 
 async function main() {
@@ -1544,9 +1591,16 @@ async function main() {
   // window is missed (cron already fired). Mitigation: keep restart MTTR low.
   cron.schedule('55 11 * * *', () => {
     console.log('[cron] noon trigger (prewarm window opened)');
-    runScheduledBooking().catch((err) => console.error(`[cron] run failed: ${err}`));
+    recordCronFired();
+    runInProgress = true;
+    runScheduledBooking()
+      .catch((err) => console.error(`[cron] run failed: ${err}`))
+      .finally(() => {
+        runInProgress = false;
+      });
   });
   console.log('✓ Noon cron scheduled (11:55 daily, fires at 12:00)');
+  startMissedRunWatchdog();
 
   // Graceful shutdown — our custom poll loop doesn't need bot.stop() (it just
   // exits on signal), but we still wire the handler so the process can be

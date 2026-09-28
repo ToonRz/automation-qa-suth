@@ -252,11 +252,11 @@ Audit `bot.stdout.log` ช่วง 2026-09-01 ถึง 2026-09-28 (โค้�
 - [x] B-5 commit `fix(engine): cancel in-flight prewarm on round cut, fresh browser after total outage`
 
 ### E — missed-run watchdog
-- [ ] E-1 `config/run-state.json` read/write (atomic tmp+rename เหมือน `courtIdCache`) + เพิ่มใน `.gitignore`
-- [ ] E-2 บันทึก state ตอน cron fire / FIRE / SKIPPED
-- [ ] E-3 watchdog 60s + check ตอน start, เตือนวันละครั้ง
-- [ ] E-4 test ตาม acceptance ของ E
-- [ ] E-5 commit `feat(bot): alert owner when the noon run was missed`
+- [x] E-1 `config/run-state.json` read/write (atomic tmp+rename เหมือน `courtIdCache`) + เพิ่มใน `.gitignore`
+- [x] E-2 บันทึก state ตอน cron fire / FIRE / SKIPPED
+- [x] E-3 watchdog 60s + check ตอน start, เตือนวันละครั้ง
+- [x] E-4 test ตาม acceptance ของ E
+- [x] E-5 commit `feat(bot): alert owner when the noon run was missed`
 
 ### F — startup + log
 - [ ] F-1 getMe retry backoff, ตั้ง cron ก่อน/ไม่ขึ้นกับ getMe
