@@ -4,6 +4,21 @@
 > อะไรที่นอกเหนือ spec (tooling ใหม่, dependency ใหม่, behavior ใหม่) ให้ถาม user ก่อน.**
 > ห้ามพิมพ์ token/password เต็มลงแชท, log, commit หรือไฟล์ใดๆ ใน repo (repo เป็น PUBLIC).
 
+## อัปเดต 2026-10-01 — ต้อง pull wipe guard (`requirements.md` §10.10)
+
+เว็บลบการจอง**ทุกแถว**ที่เข้ามาก่อนประมาณ 12:00:02 (ของทุกคน) แล้วเก็บเฉพาะแถวหลังจากนั้น — บอทเครื่องนี้โดนเหมือนกัน:
+PASS ส่วนใหญ่ในรอบเที่ยงหายไปภายใน 2 วินาที แต่ DM ยังบอก PASS. fix นี้ยิงรอบแรก 12:00:00 เหมือนเดิม แล้วเฝ้า
+reservations.php จนถึง 12:00:10: บัญชีที่ชื่อหายจะจองใหม่ทันที และ PASS นับเฉพาะบัญชีที่ยังมีชื่อตอนจบ.
+
+หลัง pull (ไม่มี dependency ใหม่): `npx tsc --noEmit` → `npm run test:wipe` (~6 นาที, mock ไม่แตะเว็บจริง) →
+restart บอท **นอกช่วง 11:50–12:15** (แจ้ง user ก่อน).
+- DM ผลจะมาช้าลงเป็นประมาณ 12:00:10–11 (เดิม 12:00:03–05) — ตั้งใจ
+- รอบเที่ยงถัดไปใน log ต้องเห็น `[wipe] watching reservations.php`, `[wipe] WIPE detected at +…ms`,
+  `[verify] <user> PASS|FAIL row=…` ครบทุกบัญชี และ `[wipe] watch end (hold window over) … unreadable=0`
+- ถ้า `unreadable` เท่ากับ `polls` แปลว่าอ่านหน้า reservations.php ไม่ออก — บอทจะคงผลรอบแรกไว้ (พฤติกรรมเดิม)
+  ให้แจ้ง user; `npm run rehearse` บอกได้ก่อนเที่ยงจากบรรทัด `[wipe] rehearsal probe`
+- ปิดได้ด้วย `WIPE_GUARD=0` ใน `.env` (ต้อง restart)
+
 ## อัปเดต 2026-09-28 — ต้อง pull ชุด fix จาก log audit
 
 ชุดนี้ **merge เข้า `main` และ push แล้ว** (`origin/main` = `06c2397`; spec:

@@ -64,7 +64,7 @@
    └─ ถ้า assigned slot ไม่ว่างในทุก court → FAIL
 7. เลือก slot เวลาของ account นั้น (ตาม Time Assignment ข้อ 2)
 8. ยืนยันการจอง (กด submit / confirm)
-9. ตรวจสอบว่าการจองสำเร็จ → บันทึก PASS + screenshot
+9. ตรวจสอบว่าการจองสำเร็จ → บันทึก PASS + screenshot (โหมด bot: ยืนยันจาก reservations.php หลัง hold window — ดู §10.10)
 10. context.close()
 ```
 
@@ -331,3 +331,24 @@ async function waitUntilNoonThenRun(): Promise<void> {
 **ไฟล์**: `src/server/botLog.ts` (NEW), `src/server/bot.ts`
 
 **ทดสอบ (10.5–10.9)**: `npm run test:log-audit` — mock server (`node:http`) + Chrome จริง, ไม่แตะเว็บจริงและ Telegram
+
+### 10.10 Post-noon wipe guard (2026-10-01)
+
+**ปัญหา**: เว็บลบการจอง**ทุกแถว**ที่เข้ามาก่อนประมาณ 12:00:02 — ของทุกคน ไม่ใช่แค่บอท — แล้วเก็บเฉพาะแถวที่เข้ามาหลังจากนั้น. เห็นใน screenshot ของ 28/09, 30/09, 01/10 (จุดตัด +1.97s ถึง +2.35s; นาฬิกาเครื่องต่างจาก NTP ~70ms และ server ต่างจากเครื่อง ≤0.2s จึงไม่ใช่ clock skew). บอทให้ PASS จากคำตอบของ POST + การอ่าน reservations.php ทันที (ก่อนถูกลบ) จึงรายงาน PASS 14–15 บัญชีต่อวัน แต่เหลือจองจริง 1–7. บัญชีที่รอดคือบัญชีที่ POST ค้างคิว server จนเลยจุดตัด.
+
+**Fix** (user เลือกทาง A):
+- รอบแรกยิงที่ 12:00:00.000 เหมือนเดิม — SC-04 ไม่เปลี่ยน และไม่มีงานใหม่ระหว่าง tick กับ submit
+- `src/wipeGuard.ts`: ตั้งแต่ FIRE+1s อ่าน reservations.php (รายการรวมของทุกคน) ผ่าน session ของบัญชีที่จบรอบแรกแล้ว ทุก 150ms (พร้อมกันไม่เกิน 2 request; ช้าลงเป็นทุก 1s หลังเห็นการลบ 2s หรือหลัง FIRE+5s ถ้ายังไม่เห็น). ประกาศ `WIPE detected` เมื่อแถวของ list ก่อนหน้าหายพร้อมกัน ≥3 แถวและ ≥50%
+- แต่ละบัญชี (`holdForWipe` ใน `src/bookingFlow.ts`) ถือผลไว้จนจบ hold window (FIRE+10s). ถ้า list ที่ขอหลัง submit ล่าสุดของตัวเองไม่มีชื่อตัวเอง → จองใหม่ทันทีที่สนามแรกที่ slot ยังว่าง: ลำดับ `COURT_PRIORITY` เฉพาะสนามที่ยังใช้ได้ หมุนตามตำแหน่งของบัญชีใน slot เดียวกัน (ข้ามสนามที่ตอบ "เกิดข้อผิดพลาดในการบันทึกข้อมูล" ≥2 ครั้ง ไม่มีใครจองได้ และมีสนามอื่นใช้ได้). ไม่ submit เลยเมื่อชื่อยังอยู่ใน list (กันจองซ้อน); แพ้ race / DB error → ลองสนามถัดไปทันที; ผลกำกวม → อ่าน list ใหม่ก่อน; เว็บตอบ "จองแล้ว" → หยุด submit; สูงสุด 6 submit ต่อบัญชี
+- ใช้กับทุกบัญชีที่รอบแรกจบเป็น PASS หรือ FAIL — รวม FAIL เพราะ slot เต็มก่อนการลบ (หลังลบ slot ว่างอีกครั้ง). ERROR / login ไม่ผ่าน / dry run ไม่เข้า hold
+- สถานะสุดท้ายมาจาก list ตอนจบ window: PASS เฉพาะเมื่อมีแถวของบัญชีนั้น (`court_booked` = สนามในแถว); ไม่มี → FAIL พร้อมเหตุผล เช่น `การจองถูกเว็บลบหลังเที่ยง (+2.1s) — จองใหม่ไม่สำเร็จ: …`. อ่าน list ไม่ได้เลย → คงผลรอบแรกและ log `[verify] … left unverified`
+- screenshot §7 ถ่าย reservations.php หลังจบ hold (สภาพสุดท้าย); report มี `verification` ต่อบัญชี (`checked_at`, `row`, `wipe_detected_at`, `first_wave_status`, `hold_submits`) และ attempt ชนิด `wiped`
+- `recordActualCourt` ไม่เอา "แถวเดียวในตาราง" มาแทนแถวของเราอีก (list เป็นของทุกคน — แถวนั้นอาจเป็นของคนอื่นและสอน court-id cache ผิด)
+- `npm run rehearse` อ่าน reservations.php 1 ครั้งหลัง dry run → `[wipe] rehearsal probe: … N row(s)` (ยืนยันว่า parse layout จริงได้)
+- kill-switch `WIPE_GUARD=0` = พฤติกรรมก่อน 2026-10-01; `WIPE_HOLD_SEC` ปรับ window (default 10)
+
+**Acceptance delta**: DM ผลออกประมาณ FIRE+10–11s (เดิม +3–5s). PASS = มีชื่อใน reservations.php ณ จบ window. **ยังไม่รู้** ว่าเว็บให้บัญชีที่ถูกลบจองใหม่ได้หรือไม่ (กฎ 1 ครั้ง/วัน — ไม่เคยเห็นเว็บตอบ "จองแล้ว" จาก POST เลย); รอบเที่ยงแรกจะบอกผ่าน `[verify]` และ `hold: already-booked`.
+
+**ไฟล์**: `src/wipeGuard.ts` (NEW), `src/bookingFlow.ts`, `src/server/bookingEngine.ts`, `src/server/testLogAudit.ts` (mock: list รวม, 1 แถวต่อ (สนาม, slot) และต่อ user, wipe, outsiders, คิว/ส่งช้า, DB error ต่อสนาม), `package.json`
+
+**ทดสอบ**: `npm run test:wipe` (w-wipe, w-nowipe, w-lost, w-already, w-killswitch) + `npm run test:log-audit` ทั้งชุด
