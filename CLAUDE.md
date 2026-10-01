@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project
 
-Playwright-based E2E automation for booking badminton courts on `https://susport.sc.su.ac.th/login.php`. 9 accounts run **in parallel, triggered exactly at 12:00:00 local time** (no tolerance).
+Playwright-based E2E automation for booking badminton courts on `https://susport.sc.su.ac.th/login.php`. In production it runs as a **Telegram bot** (`npm run bot`, kept alive by launchd) that books every account of every opted-in user (owner + friends — 17 accounts as of 2026-10) **in one parallel batch, dispatched exactly at 12:00:00 local time** (no tolerance).
 
 ## Project rule — scope discipline (user instruction)
 
@@ -14,77 +14,93 @@ Playwright-based E2E automation for booking badminton courts on `https://susport
 ## Source of truth
 
 - **`requirements.md`** — full functional spec. Treat it as the contract; this file only summarizes it.
-- **`config/accounts.json`** — credentials + per-account slot time. Currently all slots are `TBD` (see §9 of the spec). Do not invent slot values.
+  - §3.4 (slot-first court selection) and §10 (user-approved operational divergences, 10.1–10.10) **supersede** the older parts of the spec. §2, §4, §5, §7 (`court_attempted` "1 หรือ 4"), §8 and §9 still describe the original 9-account / แบดมินตัน1→4 design — do not implement against those leftovers.
+- **`config/users.json`** (gitignored; template `config/users.example.json`) — the bot's users: role (`owner`/`friend`), cron on/off, `pending_booking`, and each user's accounts (credentials + slot). Edits are picked up live via mtime reload, but must be saved before the 11:55 cron.
+- **`config/accounts.json`** (gitignored) — top-level `COURT_PRIORITY` (court order for every account; currently 6 courts) + the CLI runner's account list.
+- **`config/court-ids.json`** — cache of court label → dropdown id, refreshed by every dropdown read; used to submit courts missing from the stale pre-noon dropdown.
+- **`.env`** — `TELEGRAM_BOT_TOKEN`, `TZ=Asia/Bangkok`, `SCREENSHOTS_DIR`, `REPORTS_DIR`, and the kill-switches below.
 
-## Stack (per requirements §4)
+Never hardcode credentials, slots, or the court order in source. Do not invent slot values.
+
+## Stack
 
 | Component | Choice |
 |-----------|--------|
-| Language | TypeScript (Node.js) |
-| Automation | Playwright |
-| Parallelism | `Promise.all()` across 9 isolated `BrowserContext`s |
-| Browser | Chromium built-in or `channel: 'chrome'` |
-| Scheduler | Node.js native `setTimeout` against `Date` |
-| Config | `accounts.json` (credentials + slot) — never hardcoded in source |
-| Report | JSON + Playwright HTML reporter + per-account screenshot |
+| Language | TypeScript (Node.js, run via `ts-node`) |
+| Automation | Playwright, `channel: 'chrome'`, headless |
+| Parallelism | One browser, one fresh `BrowserContext` per account, one `Promise.all` dispatch for all users |
+| Scheduler | `node-cron` `55 11 * * *` (prewarm window) + `waitUntilLocalTimestamp` for the exact 12:00:00.000 tick |
+| Interface | Telegram bot (raw Bot API long-poll + `src/server/telegramSend.ts`) |
+| Report | `reports/bot-run-<ISO>.json` (§7 fields + extras), `screenshots/<YYYY-MM-DD>/<username>.png`, per-user DMs + owner summary; 30-day retention |
 
 ## Develop / Run
-
-After the initial scaffold (package.json + playwright.config.ts + src/), the day-to-day commands are:
 
 ```bash
 npm install
 npx playwright install chromium
 
-# Run the scheduled booking bot (waits until 12:00:00, then fires all 9)
-npm start
+npm run bot          # production: Telegram bot + 11:55 cron (normally via launchd, see README §10)
+npm run rehearse     # dry-run the bot engine end-to-end without booking
+npm start            # CLI path: src/scheduler.ts waits for 12:00, books config/accounts.json
+npm run account -- <username>   # one account now (debugging)
+npm run discover     # list courts/slots on the live site
 
-# Run a single account's flow end-to-end (debugging aid)
-npm run account -- <username>
-
-# Tests — Playwright Test runner
-npx playwright test                # full suite
-npx playwright test --grep "login" # single test by name
-npx playwright test --headed       # watch locally
+# Tests are ts-node scripts against a local mock server — never the real site or Telegram
+npm run test:log-audit   # full log-audit suite (§10.5–10.10)
+npm run test:wipe        # wipe-guard scenarios only
+npm run test:fast-confirm
+npm run bot:test-wizards
 ```
 
-## Project layout (per requirements §5)
+There is no `playwright.config.ts` and no Playwright Test runner.
+
+## Project layout
 
 ```
-court-booking-bot/
-├── package.json
-├── playwright.config.ts
-├── config/accounts.json      ← credentials + per-account slot (slots are TBD)
-├── src/
-│   ├── scheduler.ts          ← waitUntilNoonThenRun()
-│   ├── runner.ts             ← Promise.all of 9 contexts
-│   └── bookingFlow.ts        ← per-account: login → court → book
-├── reports/                  ← auto-generated JSON + HTML
-└── screenshots/              ← one per account, PASS and FAIL
+config/            users.json, accounts.json (COURT_PRIORITY), court-ids.json, run-state.json
+src/
+├── server/
+│   ├── bot.ts             ← Telegram commands, 11:55 cron, runScheduledBooking, missed-noon watchdog
+│   ├── bookingEngine.ts   ← runPrewarmedBatch (prewarm → tick → dispatch) / runStandard
+│   ├── runReport.ts       ← §7 JSON report + retention
+│   ├── runState.ts        ← cron-fired / dispatched dates for the watchdog
+│   ├── userStore.ts       ← users.json access
+│   └── test*.ts, rehearse.ts
+├── bookingFlow.ts     ← bookOneAccount: per-account login → court → submit → verify (+ holdForWipe)
+├── wipeGuard.ts       ← post-noon reservations.php watcher (§10.10)
+├── courtIdCache.ts
+├── scheduler.ts, runner.ts   ← CLI path
+reports/, screenshots/<date>/, bot.log
+doc/               handoffs and fix plans
 ```
+
+## Daily run (bot)
+
+1. **11:55 cron** — pick users: owner + friends with cron on, plus cron-off friends who sent `/book`; prewarm DM to cron-on users.
+2. **Prewarm** — arm the T-4m total-outage DM, launch Chrome, then every account logs in on a fresh context in parallel → `page-ready` (court+slot pre-selected) / `login-ready` (stale dropdown; use cached court id at noon) / `needs-standard` (already booked) / `failed` (retried every 30s until T-40s; all failed → fresh browser).
+3. **T-40s → T** — resolve each account's target court, build the wipe guard. Nothing but the dispatch runs after 12:00:00.000.
+4. **12:00:00.000** — dispatch every account in the same tick. Woke >30s late → no dispatch, FAIL `missed-deadline`.
+5. **Wipe hold (FIRE+1s → +10s)** — poll `reservations.php`; a wiped account re-books. Final PASS only if its row is in the list.
+6. **Report** — DM each user as soon as their accounts settle (90s budget → `ERROR`), write the JSON report, owner summary; browser teardown is detached.
+
+Watchdog: from 12:05, if a cron-on user exists and nothing was dispatched today → one DM to the owner (no late booking).
 
 ## Hard rules from requirements
 
 These are non-negotiable. They are the basis for every fix, refactor, and review.
 
-1. **Strict 12:00:00 trigger, no tolerance** (SC-04). Scheduler fires on the exact local-noon millisecond.
-2. **Never reuse a context** (BR-01/02). Each account = `browser.newContext()` with `storageState: undefined`. `context.close()` on every exit path — success or failure.
-3. **Court fallback is fixed** (§3.4): แบดมินตัน1 → แบดมินตัน4 → `FAIL` with reason `"ทั้ง 2 สนามเต็ม"`. No other court, no reordered fallback.
-4. **Parallel release** (SC-05). All 9 contexts must start in the same tick via `Promise.all`. One slow login must not delay the others.
-5. **Screenshot every account** (Report Requirements, §7). Both PASS and FAIL.
-6. **Per-account report fields** (requirements §7): `username`, `triggered_at`, `court_attempted`, `court_booked`, `slot`, `status`, `fail_reason`, `screenshot`, `duration_ms`.
+1. **Strict 12:00:00 trigger, no tolerance** (SC-04). The dispatch fires on the exact local-noon millisecond; no new work may sit between the tick and the submits. Prewarm before noon is allowed; booking after a missed noon is not.
+2. **Never reuse a context** (BR-01/02/04). Each account = `browser.newContext({ storageState: undefined })`. `context.close()` on every exit path — success, failure, cut prewarm round — detached and timed so it never blocks results.
+3. **Court selection is slot-first** (§3.4, §10.4): each account books **only its own slot**, trying `COURT_PRIORITY` in order, then remaining badminton courts as a safety net. Accounts sharing a slot get the list **rotated** by their position in the group (de-confliction). No per-court slot fallback. Slot full everywhere → `FAIL` `slot {slot} ไม่ว่างในทุกสนาม`. Retry budget 30s per account.
+4. **Parallel release** (SC-05). All accounts of all users dispatch in the same tick via one `Promise.all`. One slow account must not delay the others or another user's DM.
+5. **PASS means the row is in `reservations.php`** (§10.10). The first-wave answer is provisional; `court_booked` comes from the list, not from the submitted id.
+6. **Screenshot every account** (§7), PASS and FAIL, taken after the hold.
+7. **Per-account report fields** (§7): `username`, `triggered_at`, `court_attempted`, `court_booked`, `slot`, `status`, `fail_reason`, `screenshot`, `duration_ms`.
+8. **Every wait is bounded** (§10.5–10.6): page fetches use `AbortController`, per-account settle budget 90s, prewarm rounds have a deadline. A hung Chrome must never delay the DMs.
 
-## Per-account flow (requirements §3.3)
+## Kill-switches (`.env`)
 
-```
-newContext → https://susport.sc.su.ac.th/login.php
-  → fill username/password → submit → confirm login
-  → navigate to booking page
-  → select แบดมินตัน1 (fallback แบดมินตัน4) → pick slot → submit
-  → verify booking success → record result + screenshot
-  → context.close()
-```
-
-## Known gap
-
-`requirements.md` §9: **slot times per account are still `TBD`.** Do not fabricate values — surface this to the user before running.
+- `DEEP_PREWARM=0` — skip prewarm; full login for every account at noon (`runStandard`).
+- `WIPE_GUARD=0` — disable the post-noon hold (pre-2026-10-01 behavior); `WIPE_HOLD_SEC` sets the hold window (default 10).
+- `SUBMIT_VIA=click` — real button click instead of the default in-page `fetch` POST.
+- `PREWARM_LEAD_SEC` — prewarm lead before noon (default 300; the cron itself is fixed at 11:55).
