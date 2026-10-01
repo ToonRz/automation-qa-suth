@@ -1,7 +1,13 @@
 // src/server/testLogAudit.ts
 //
 // Mock-server harness for the 2026-09-28 log-audit fixes
-// (doc/fix-plan-2026-09-28-log-audit.md — tasks C, D, A, B, E, F).
+// (doc/fix-plan-2026-09-28-log-audit.md — tasks C, D, A, B, E, F) and the
+// 2026-10-01 post-noon wipe guard (scenarios w-*, src/wipeGuard.ts).
+//
+// The mock keeps ONE global reservations list like the live site (every user
+// sees every row; one row per (court, slot) and per user) and can wipe it,
+// add outsiders' rows, delay or hold answers, and fail chosen courts with the
+// site's DB error.
 //
 // Drives the REAL engine and a REAL headless Chrome against a node:http mock
 // of susport. Every context the engine opens gets a route that forwards
@@ -78,6 +84,20 @@ interface MockPlan {
   /** Outcome of a user's n-th (0-based) book_court.php POST. 'hang-books'
    *  records the booking server-side and then never answers. */
   bookPost: (user: string, n: number) => PostMode;
+  /** Server queue: ms between a POST arriving and the booking being decided.
+   *  The row is inserted at the END of the wait, as on the real site, whose
+   *  noon POSTs sat 0.3–4s in its queue. */
+  postDelayMs: (user: string, n: number) => number;
+  /** ms between the decision (row already inserted) and the answer. */
+  respondDelayMs: (user: string, n: number) => number;
+  /** Courts whose every booking fails with the site's DB error
+   *  (แบดมินตัน1/2 on 2026-10-01). */
+  courtErrors: Set<string>;
+  /** A site that still counts WIPED rows for its one-booking-per-day rule. */
+  countsWipedRows: boolean;
+  /** Render the reservations header with <td> instead of <th> (the live
+   *  markup has only been seen in screenshots). */
+  tdHeader: boolean;
 }
 
 interface MockRequest {
@@ -88,20 +108,87 @@ interface MockRequest {
   body: string;
 }
 
+/** One row of the site's global reservations list. */
+interface MockRow {
+  user: string;
+  court: string;
+  slot: string;
+  no: number;
+  at: number;
+}
+
+// The site's own alert() copy (dialogs captured live; already-booked is a guess
+// that matches ALREADY_BOOKED_INDICATORS — the live site has never shown it).
+const RACE_LOSS_ALERT =
+  'เสียใจด้วยครับ มีคนยืนยันการจองสนามนี้ในเวลาเดียวกันไปก่อนหน้าคุณแล้ว (ระบบให้สิทธิ์ผู้ที่ยืนยันก่อน)';
+const DB_ERROR_ALERT = 'เกิดข้อผิดพลาดในการบันทึกข้อมูล กรุณาลองใหม่อีกครั้ง';
+const ALREADY_BOOKED_ALERT = 'คุณได้จองสนามวันนี้แล้ว';
+
+function courtLabelOf(courtId: string): string {
+  return Object.keys(COURT_IDS).find((k) => COURT_IDS[k] === courtId) ?? `id-${courtId}`;
+}
+
 class MockSusport {
   plan: MockPlan = {
     login: 'ok',
     reservedTimes: 'ok',
     reservations: 'ok',
     bookPost: () => 'ok',
+    postDelayMs: () => 0,
+    respondDelayMs: () => 0,
+    courtErrors: new Set(),
+    countsWipedRows: false,
+    tdHeader: false,
   };
   requests: MockRequest[] = [];
-  bookings = new Map<string, { court: string; slot: string }>();
+  /** Today's global list — what reservations.php shows to every user, as the
+   *  live site does. One row per (court, slot) and per user. */
+  rows: MockRow[] = [];
+  /** Every row ever inserted; a wipe does not touch this. */
+  inserted: MockRow[] = [];
+  /** When each wipe() ran. */
+  wipes: number[] = [];
   frozen = false;
+  private wipedUsers = new Set<string>();
+  private nextNo = 1;
+  private timers: NodeJS.Timeout[] = [];
   private held: Array<() => void> = [];
   private posts = new Map<string, number>();
   private server = http.createServer((req, res) => this.onRequest(req, res));
   port = 0;
+
+  rowOf(user: string): MockRow | undefined {
+    return this.rows.find((r) => r.user === user);
+  }
+
+  /** The post-noon wipe: every row goes, booking numbers keep counting. */
+  wipe(): void {
+    for (const r of this.rows) this.wipedUsers.add(r.user);
+    this.rows = [];
+    this.wipes.push(Date.now());
+  }
+
+  /** Run `fn` at wall-clock `atMs` (cancelled by stop()). */
+  at(atMs: number, fn: () => void): void {
+    this.timers.push(setTimeout(fn, Math.max(0, atMs - Date.now())));
+  }
+
+  /** Someone who is not one of our accounts books (court, slot), if free. */
+  outsider(user: string, court: string, slot: string): boolean {
+    return this.decide(user, court, slot) === 'ok';
+  }
+
+  /** The site's booking decision; inserts the row on 'ok'. */
+  private decide(user: string, court: string, slot: string): 'ok' | 'race' | 'already' | 'db-error' {
+    if (this.plan.courtErrors.has(court)) return 'db-error';
+    if (this.rows.some((r) => r.user === user)) return 'already';
+    if (this.plan.countsWipedRows && this.wipedUsers.has(user)) return 'already';
+    if (this.rows.some((r) => r.court === court && r.slot === slot)) return 'race';
+    const row: MockRow = { user, court, slot, no: this.nextNo++, at: Date.now() };
+    this.rows.push(row);
+    this.inserted.push(row);
+    return 'ok';
+  }
 
   async start(): Promise<void> {
     await new Promise<void>((resolve) => this.server.listen(0, '127.0.0.1', () => resolve()));
@@ -122,6 +209,7 @@ class MockSusport {
   }
 
   async stop(): Promise<void> {
+    for (const t of this.timers) clearTimeout(t);
     this.server.closeAllConnections();
     await new Promise<void>((resolve) => this.server.close(() => resolve()));
   }
@@ -162,36 +250,62 @@ class MockSusport {
       case '/booking.php':
         // GET = reload; POST = the login form submit (action="booking.php").
         return html(BOOKING_HTML);
-      case '/get_reserved_times.php':
+      case '/get_reserved_times.php': {
         if (this.plan.reservedTimes === 'hang') return;
-        return send(200, 'application/json', '[]');
+        const court = courtLabelOf(new URLSearchParams(body).get('court_id') ?? '');
+        const reserved = this.rows.filter((r) => r.court === court).map((r) => r.slot);
+        return send(200, 'application/json', JSON.stringify(reserved));
+      }
       case '/book_court.php': {
         const n = this.posts.get(user) ?? 0;
         this.posts.set(user, n + 1);
         const mode = this.plan.bookPost(user, n);
         if (mode === 'hang') return;
         const params = new URLSearchParams(body);
-        const courtId = params.get('court_id') ?? '';
-        const court = Object.keys(COURT_IDS).find((k) => COURT_IDS[k] === courtId) ?? `id-${courtId}`;
-        this.bookings.set(user, { court, slot: params.get('time_slot') ?? '' });
-        if (mode === 'hang-books') return;
-        return html(this.reservationsHtml(user));
+        const court = courtLabelOf(params.get('court_id') ?? '');
+        const slot = params.get('time_slot') ?? '';
+        const decideAndAnswer = (): void => {
+          const verdict = this.decide(user, court, slot);
+          if (mode === 'hang-books') return;
+          // Rendered at decision time, delivered after respondDelayMs: a
+          // success page can reach us after the wipe already removed its row.
+          const msg =
+            verdict === 'race'
+              ? RACE_LOSS_ALERT
+              : verdict === 'already'
+                ? ALREADY_BOOKED_ALERT
+                : DB_ERROR_ALERT;
+          const page =
+            verdict === 'ok'
+              ? this.reservationsHtml()
+              : `<html><body><script>alert('${msg}'); location = 'booking.php';</script></body></html>`;
+          const later = this.plan.respondDelayMs(user, n);
+          if (later > 0) setTimeout(() => html(page), later);
+          else html(page);
+        };
+        const queued = this.plan.postDelayMs(user, n);
+        if (queued > 0) setTimeout(decideAndAnswer, queued);
+        else decideAndAnswer();
+        return;
       }
       case '/reservations.php':
         if (this.plan.reservations === 'hang' && method === 'GET') return;
-        return html(this.reservationsHtml(user));
+        return html(this.reservationsHtml());
       default:
         return send(404, 'text/plain', 'not found');
     }
   }
 
-  private reservationsHtml(user: string): string {
-    const b = this.bookings.get(user);
-    const row = b ? `<tr><td>${user}</td><td>${b.court}</td><td>${b.slot}</td></tr>` : '';
+  /** The live layout: one global table, sorted by court then booking number. */
+  private reservationsHtml(): string {
+    const rows = [...this.rows].sort((a, b) => a.court.localeCompare(b.court) || a.no - b.no);
+    const c = this.plan.tdHeader ? 'td' : 'th';
     return (
       '<html><body><h2>การจองสนามในวันที่ 2026-09-28</h2>' +
-      '<table><tr><th>ชื่อผู้ใช้</th><th>สนาม</th><th>เวลา</th></tr>' +
-      row +
+      `<table><tr><${c}>ชื่อผู้ใช้</${c}><${c}>สนาม</${c}><${c}>เวลา</${c}><${c}>ลำดับการจอง</${c}></tr>` +
+      rows
+        .map((r) => `<tr><td>${r.user}</td><td>${r.court}</td><td>${r.slot}</td><td>${r.no}</td></tr>`)
+        .join('') +
       '</table></body></html>'
     );
   }
@@ -519,6 +633,10 @@ function freezeAroundTick(target: Date, releaseAfterMs: number): void {
   setTimeout(() => h.freezeAll(), target.getTime() - Date.now() - 300);
   setTimeout(() => h.releaseAll(), target.getTime() - Date.now() + releaseAfterMs);
 }
+
+/** When the mock site wipes its list after the tick — the live cut fell at
+ *  +1.97s..+2.35s on 2026-09-28/30 and 10-01. */
+const WIPE_AFTER_MS = 2_000;
 
 function daysAgo(n: number): string {
   return runReport.bangkokDate(new Date(Date.now() - n * 86_400_000));
@@ -1013,6 +1131,195 @@ const scenarios: Scenario[] = [
       assert.ok(!/writeFileSync\(LOG_PATH, ''\)/.test(src), 'bot.log no longer truncated at start');
     },
   },
+  {
+    name: 'w-wipe',
+    about: 'W: site wipes every row at FIRE+2s → wiped PASSes re-book (lost court → next), POST queued past the cut kept, success answered after the cut re-booked, first-wave FAIL books after the wipe, dead court skipped; status = the list',
+    run: async () => {
+      process.env.WIPE_HOLD_SEC = '6';
+      process.env.PREWARM_LEAD_SEC = '55';
+      const target = new Date(Date.now() + 55_000);
+      const T = target.getTime();
+      const acct = (n: number, slot: string): Account => ({
+        username: `wipe-u${n}`,
+        password: 'mock-pw',
+        slot,
+      });
+      const accounts = [
+        acct(1, '18:30_19:30'), // first wave PASS → wiped → its court taken by an outsider
+        acct(2, '18:30_19:30'), // dead court twice, PASS on the next → wiped → re-book
+        acct(3, '19:30_20:30'), // POST queued 2.6s → inserted after the cut → kept
+        acct(4, '19:30_20:30'), // dead court twice, PASS on the next → wiped → re-book
+        acct(5, '20:30_21:30'), // slot taken everywhere → first wave FAIL → books after the cut
+        acct(6, '21:30_22:30'), // inserted before the cut, answered after it → re-book
+      ];
+      h.mock.plan.courtErrors = new Set(['แบดมินตัน2']);
+      h.mock.plan.postDelayMs = (user, n) => (user === 'wipe-u3' && n === 0 ? 2_600 : 0);
+      h.mock.plan.respondDelayMs = (user, n) => (user === 'wipe-u6' && n === 0 ? 2_300 : 0);
+      h.mock.at(T - 100, () => {
+        for (const c of Object.keys(COURT_IDS)) h.mock.outsider(`early-${c}`, c, '20:30_21:30');
+      });
+      h.mock.at(T + WIPE_AFTER_MS, () => h.mock.wipe());
+      h.mock.at(T + WIPE_AFTER_MS + 5, () => h.mock.outsider('outsider-x', 'แบดมินตัน3', '18:30_19:30'));
+
+      const { settled, onAccountSettled } = collectSettled();
+      const res = await engine.runPrewarmedBatch(accounts, target, { onAccountSettled });
+      const firedAt = Date.parse(res.fired_at);
+      const byUser = new Map(res.results.map((r) => [r.username, r]));
+      const wipedAt = h.mock.wipes[0];
+      assert.equal(h.mock.wipes.length, 1, 'the site wiped once');
+
+      for (const a of accounts) {
+        const r = byUser.get(a.username)!;
+        const row = h.mock.rowOf(a.username);
+        assert.ok(row, `${a.username} holds a row at the end`);
+        assert.equal(r.status, 'PASS', `${a.username} PASS`);
+        assert.equal(r.court_booked, row!.court, `${a.username} reports the court the list shows`);
+        assert.equal(r.verification?.row?.court, row!.court);
+        assert.ok(row!.at > wipedAt, `${a.username}'s row was inserted after the wipe`);
+        assert.notEqual(row!.court, 'แบดมินตัน2', `${a.username} not on the dead court`);
+        assert.ok(fs.existsSync(r.screenshot), `${a.username} screenshot`);
+      }
+      assert.equal(h.mock.rowOf('outsider-x')?.court, 'แบดมินตัน3', 'the outsider kept its court');
+
+      const posts = (u: string) => h.mock.postsBy(u).length;
+      assert.equal(posts('wipe-u3'), 1, 'u3: queued past the cut — never re-submitted');
+      assert.equal(byUser.get('wipe-u3')!.verification?.hold_submits, 0);
+      assert.equal(posts('wipe-u6'), 2, 'u6: answered after the cut — one re-book');
+      assert.equal(byUser.get('wipe-u5')!.verification?.first_wave_status, 'FAIL');
+      for (const u of ['wipe-u1', 'wipe-u2', 'wipe-u4', 'wipe-u6']) {
+        const r = byUser.get(u)!;
+        assert.equal(r.verification?.first_wave_status, 'PASS', `${u}: first wave PASS`);
+        assert.ok(r.attempts.some((t) => t.outcome === 'wiped'), `${u}: wipe recorded`);
+      }
+      const deadAfterWipe = h.mock.requests.filter(
+        (q) => q.path === '/book_court.php' && q.at > wipedAt && /(^|&)court_id=102(&|$)/.test(q.body)
+      );
+      assert.equal(deadAfterWipe.length, 0, 'no re-book on the dead แบดมินตัน2');
+
+      assert.ok(h.has(/^\[wipe\] WIPE detected at \+\d+ms: \d+ of \d+ row\(s\) gone/), 'wipe detected');
+      assert.ok(h.has(/^\[wipe\] watch end \(hold window over\)/), 'watch ended with the window');
+      for (const st of settled) {
+        const after = st.at - firedAt;
+        assert.ok(after >= 5_900 && after < 9_000, `${st.result.username} settled at +${after}ms`);
+      }
+    },
+  },
+  {
+    name: 'w-nowipe',
+    about: 'W: no wipe → every first-wave PASS confirmed from the list at the end of the hold; nobody submits twice',
+    run: async () => {
+      process.env.WIPE_HOLD_SEC = '4';
+      process.env.PREWARM_LEAD_SEC = '55';
+      const target = new Date(Date.now() + 55_000);
+      const { settled, onAccountSettled } = collectSettled();
+      const res = await engine.runPrewarmedBatch(mockAccounts(3), target, { onAccountSettled });
+      const firedAt = Date.parse(res.fired_at);
+
+      assert.deepEqual(res.results.map((r) => r.status), ['PASS', 'PASS', 'PASS']);
+      for (const r of res.results) {
+        assert.equal(h.mock.postsBy(r.username).length, 1, `${r.username}: one POST`);
+        assert.equal(r.court_booked, h.mock.rowOf(r.username)?.court);
+        assert.equal(r.verification?.hold_submits, 0);
+        assert.equal(r.verification?.wipe_detected_at, null);
+      }
+      assert.equal(h.find(/^\[verify\] mock-u\d PASS row=แบดมินตัน\d\/18:30_19:30#\d+ /).length, 3);
+      assert.ok(!h.has(/WIPE detected|rows vanished|row gone/), 'no wipe seen');
+      const end = h.find(/^\[wipe\] watch end \(hold window over\) at \+\d+ms: polls=(\d+)/)[0];
+      assert.ok(end, 'watch ended with the window');
+      const polls = Number(/polls=(\d+)/.exec(end.text)?.[1]);
+      assert.ok(polls >= 5 && polls <= 40, `polling stayed bounded (${polls})`);
+      for (const st of settled) {
+        const after = st.at - firedAt;
+        assert.ok(after >= 3_900 && after < 6_500, `${st.result.username} settled at +${after}ms`);
+      }
+      assertUntouchedNormalRun();
+    },
+  },
+  {
+    name: 'w-lost',
+    about: 'W: outsiders take the slot on every court right after the wipe → honest FAIL "ถูกเว็บลบ", no PASS, no pointless submit (header row in <td>)',
+    run: async () => {
+      process.env.WIPE_HOLD_SEC = '5';
+      process.env.PREWARM_LEAD_SEC = '55';
+      h.mock.plan.tdHeader = true;
+      const target = new Date(Date.now() + 55_000);
+      const T = target.getTime();
+      h.mock.at(T + 50, () => {
+        for (const c of ['แบดมินตัน4', 'แบดมินตัน5', 'แบดมินตัน6']) h.mock.outsider(`early-${c}`, c, '19:30_20:30');
+      });
+      h.mock.at(T + WIPE_AFTER_MS, () => {
+        h.mock.wipe();
+        for (const c of Object.keys(COURT_IDS)) h.mock.outsider(`late-${c}`, c, '18:30_19:30');
+      });
+      const { onAccountSettled } = collectSettled();
+      const res = await engine.runPrewarmedBatch(mockAccounts(2), target, { onAccountSettled });
+
+      assert.ok(h.has(/^\[wipe\] WIPE detected/), 'wipe detected');
+      for (const r of res.results) {
+        assert.equal(r.status, 'FAIL', `${r.username} FAIL`);
+        assert.equal(r.court_booked, null);
+        assert.match(
+          String(r.fail_reason),
+          /^การจองถูกเว็บลบหลังเที่ยง \(\+\d+\.\ds\) — จองใหม่ไม่สำเร็จ: ไม่มีสนามว่าง$/
+        );
+        assert.equal(r.verification?.row, null);
+        assert.equal(r.verification?.first_wave_status, 'PASS');
+        assert.equal(h.mock.postsBy(r.username).length, 1, `${r.username}: nothing free → no re-book submit`);
+        assert.equal(h.mock.rowOf(r.username), undefined);
+      }
+    },
+  },
+  {
+    name: 'w-already',
+    about: 'W: the site counts wiped rows for its 1-per-day rule → re-book answered "already booked": stop submitting, FAIL with a check-the-site reason',
+    run: async () => {
+      process.env.WIPE_HOLD_SEC = '5';
+      process.env.PREWARM_LEAD_SEC = '55';
+      h.mock.plan.countsWipedRows = true;
+      const target = new Date(Date.now() + 55_000);
+      const T = target.getTime();
+      h.mock.at(T + 50, () => {
+        for (const c of ['แบดมินตัน4', 'แบดมินตัน5', 'แบดมินตัน6']) h.mock.outsider(`early-${c}`, c, '19:30_20:30');
+      });
+      h.mock.at(T + WIPE_AFTER_MS, () => h.mock.wipe());
+      const { onAccountSettled } = collectSettled();
+      const res = await engine.runPrewarmedBatch(mockAccounts(1), target, { onAccountSettled });
+      const r = res.results[0];
+
+      assert.equal(r.status, 'FAIL');
+      assert.equal(r.fail_reason, 'เว็บตอบว่าจองวันนี้แล้ว แต่ไม่พบชื่อใน reservations.php — ให้เช็คหน้าเว็บ');
+      assert.equal(h.mock.postsBy('mock-u1').length, 2, 'one re-book submit, then stop');
+      assert.ok(r.attempts.some((t) => t.reason === 'hold: already-booked'));
+      assert.equal(r.verification?.hold_submits, 1);
+    },
+  },
+  {
+    name: 'w-killswitch',
+    about: 'W: WIPE_GUARD=0 → pre-fix path: PASS straight from the POST answer, no hold — while the site has already wiped both rows (the false PASS of 09-28/09-30/10-01)',
+    run: async () => {
+      process.env.WIPE_GUARD = '0';
+      try {
+        process.env.PREWARM_LEAD_SEC = '55';
+        const target = new Date(Date.now() + 55_000);
+        h.mock.at(target.getTime() + WIPE_AFTER_MS, () => h.mock.wipe());
+        const { settled, onAccountSettled } = collectSettled();
+        const res = await engine.runPrewarmedBatch(mockAccounts(2), target, { onAccountSettled });
+        const firedAt = Date.parse(res.fired_at);
+        await sleep(Math.max(0, firedAt + WIPE_AFTER_MS + 300 - Date.now()));
+
+        assert.deepEqual(res.results.map((r) => r.status), ['PASS', 'PASS'], 'reported PASS');
+        assert.equal(h.mock.wipes.length, 1, 'the site wiped once');
+        assert.equal(h.mock.rows.length, 0, '…and neither PASS still has a row');
+        for (const st of settled) {
+          assert.ok(st.at - firedAt < WIPE_AFTER_MS, `${st.result.username} settled before the wipe`);
+        }
+        assert.ok(!h.has(/^\[(wipe|verify)\]/), 'no guard activity');
+        for (const n of [1, 2]) assert.equal(h.mock.postsBy(`mock-u${n}`).length, 1, 'one POST each');
+      } finally {
+        delete process.env.WIPE_GUARD;
+      }
+    },
+  },
 ];
 
 async function main(): Promise<void> {
@@ -1028,6 +1335,8 @@ async function main(): Promise<void> {
     h = new Harness();
     await h.mock.start();
     delete process.env.PREWARM_LEAD_SEC;
+    delete process.env.WIPE_HOLD_SEC;
+    delete process.env.WIPE_GUARD;
     rawWrite(`\n=== ${s.name} — ${s.about}\n`);
     const t0 = Date.now();
     try {

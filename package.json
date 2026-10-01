@@ -15,7 +15,8 @@
     "bot:test-results": "NODE_OPTIONS=--dns-result-order=ipv4first ts-node src/server/testResultsNotices.ts",
     "bot:test-wizards": "ts-node src/server/testWizardHelpers.ts",
     "test:fast-confirm": "ts-node src/server/testFastConfirm.ts",
-    "test:log-audit": "ts-node src/server/testLogAudit.ts"
+    "test:log-audit": "ts-node src/server/testLogAudit.ts",
+    "test:wipe": "ts-node src/server/testLogAudit.ts w-wipe w-nowipe w-lost w-already w-killswitch"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

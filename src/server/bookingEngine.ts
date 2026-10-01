@@ -43,6 +43,7 @@ import {
 } from '../bookingFlow';
 import { getCourtId, updateCourtIds } from '../courtIdCache';
 import { waitUntilLocalTimestamp } from '../localClock';
+import { WipeGuard, fetchReservationSnapshot, wipeGuardEnabled } from '../wipeGuard';
 import { COURTS } from './configLoader';
 import { bangkokDate, formatResultLine, screenshotsBaseDir } from './runReport';
 import { sendTelegramMessage } from './telegramSend';
@@ -282,6 +283,44 @@ function afterInFlight(inFlight: Promise<unknown>[], teardown: () => void): void
 
 async function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * The batch's post-noon wipe guard (src/wipeGuard.ts), or undefined for dry
+ * runs and WIPE_GUARD=0. Built BEFORE the tick — its first poll is at FIRE+1s,
+ * so nothing new sits between 12:00:00.000 and the submits.
+ */
+function makeWipeGuard(
+  accounts: Account[],
+  rotations: number[],
+  fireAt: number,
+  opts: BatchOptions
+): WipeGuard | undefined {
+  if (opts.dryRun || !wipeGuardEnabled()) return undefined;
+  return new WipeGuard({
+    fireAt,
+    courtOrder: COURTS,
+    members: accounts.map((a, i) => ({ username: a.username, slot: a.slot, rotation: rotations[i] })),
+  });
+}
+
+/** Rehearsal only: read the live reservations list once through a prewarmed
+ *  page, so a dry run proves the wipe guard can parse today's layout. */
+async function probeReservationsList(entries: PrewarmedAccount[]): Promise<void> {
+  if (!wipeGuardEnabled()) return;
+  const page = entries.find((e) => e.page && !e.page.isClosed())?.page;
+  if (!page) return;
+  const snap = await fetchReservationSnapshot(page);
+  if (snap) {
+    console.log(
+      `[wipe] rehearsal probe: reservations.php readable — ${snap.rows.length} row(s) ` +
+        `in ${snap.receivedAt - snap.issuedAt}ms`
+    );
+  } else {
+    console.warn(
+      '[wipe] rehearsal probe: reservations.php NOT readable — the noon guard would see no list'
+    );
+  }
 }
 
 /** Screenshots go to `<SCREENSHOTS_DIR>/<YYYY-MM-DD>/` (Bangkok date of
@@ -655,10 +694,14 @@ export async function runStandard(
   const priorities = rotations.map((k) => rotateCourts(COURTS, k));
   const flowBase = baseFlowOptions(browser, opts, new Date());
   let dispatched: Promise<BookingResult>[] = [];
+  let guard: WipeGuard | undefined;
   try {
     const firedAt = new Date();
+    // Every account logs in first on this path, so building the guard here
+    // delays no submit.
+    guard = makeWipeGuard(accounts, rotations, firedAt.getTime(), opts);
     dispatched = accounts.map((account, i) =>
-      bookOneAccount(account, { ...flowBase, courtPriority: priorities[i] })
+      bookOneAccount(account, { ...flowBase, wipeGuard: guard, courtPriority: priorities[i] })
     );
     notifyDispatched(opts, { fired_at: firedAt.toISOString(), drift_ms: null, skipped: false });
     const results = await Promise.all(
@@ -675,6 +718,7 @@ export async function runStandard(
         })
       )
     );
+    guard?.stop('all accounts settled');
     return {
       results,
       mode: 'standard',
@@ -684,6 +728,7 @@ export async function runStandard(
       prewarm: null,
     };
   } finally {
+    guard?.stop('batch ended');
     // Accounts closed their own contexts (they own them on the standard
     // path); only the shared browser remains — detached, timed, and only
     // after any account still running past its settle budget has finished.
@@ -746,6 +791,7 @@ export async function runPrewarmedBatch(
 
   const browsers: Browser[] = []; // every browser this batch launched
   let dispatched: Promise<BookingResult>[] = [];
+  let guard: WipeGuard | undefined;
   try {
     const tLaunch = Date.now();
     let browser = await chromium.launch({ channel: 'chrome', headless: true });
@@ -889,9 +935,10 @@ export async function runPrewarmedBatch(
           })
           .join(' ')
     );
-    // Shared flow options (incl. the dated screenshot folder) — built before
-    // the tick so the dispatch loop does no extra work.
-    const flowBase = baseFlowOptions(browser, opts, targetTime);
+    // Shared flow options (incl. the dated screenshot folder and the wipe
+    // guard) — built before the tick so the dispatch loop does no extra work.
+    guard = makeWipeGuard(accounts, rotations, targetTime.getTime(), opts);
+    const flowBase: FlowOptions = { ...baseFlowOptions(browser, opts, targetTime), wipeGuard: guard };
 
     // Phase 2: the exact local tick (SC-01/SC-04).
     await waitUntilLocalTimestamp(targetTime.getTime());
@@ -902,6 +949,7 @@ export async function runPrewarmedBatch(
       console.warn(
         `[bookingEngine] dispatch SKIPPED (drift ${driftMs}ms > ${DRIFT_SKIP_MS}ms — race already lost)`
       );
+      guard?.stop('dispatch skipped');
       const missResults: BookingResult[] = accounts.map((account) => ({
         username: account.username,
         triggered_at: firedAt.toISOString(),
@@ -970,6 +1018,8 @@ export async function runPrewarmedBatch(
         })
       )
     );
+    guard?.stop('all accounts settled');
+    if (opts.dryRun) await probeReservationsList(entries);
 
     return {
       results,
@@ -980,6 +1030,7 @@ export async function runPrewarmedBatch(
       prewarm: tallyCounts(entries, retryRounds),
     };
   } finally {
+    guard?.stop('batch ended');
     if (outageTimer) clearTimeout(outageTimer);
     // Detached teardown — results/DMs never wait on Chrome shutdown.
     if (browsers.length > 0) {

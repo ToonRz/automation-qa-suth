@@ -29,6 +29,7 @@ import { Browser, BrowserContext, Dialog, Locator, Page, chromium } from 'playwr
 import * as fs from 'fs';
 import * as path from 'path';
 import { getCourtId, updateCourtIds } from './courtIdCache';
+import { WipeGuard, failKind, fetchReservationSnapshot } from './wipeGuard';
 
 export interface Account {
   username: string;
@@ -44,8 +45,30 @@ export interface Account {
 export interface AttemptRecord {
   court: string;
   slot: string;
-  outcome: 'success' | 'slot-not-available' | 'submit-fail' | 'dry-run-would-book' | 'no-slots-on-court';
+  /** 'wiped' = a booking we held disappeared from reservations.php (the
+   *  site's post-noon wipe — src/wipeGuard.ts). */
+  outcome:
+    | 'success'
+    | 'slot-not-available'
+    | 'submit-fail'
+    | 'dry-run-would-book'
+    | 'no-slots-on-court'
+    | 'wiped';
   reason?: string;
+}
+
+/** How the final status was checked against reservations.php (wipe guard). */
+export interface BookingVerification {
+  /** When the reservations list behind the verdict was requested. */
+  checked_at: string;
+  /** Our row in that list, or null. */
+  row: { court: string; slot: string; no: string } | null;
+  /** When the guard first saw the site wipe the list; null = not seen. */
+  wipe_detected_at: string | null;
+  /** What the first wave reported before the hold. */
+  first_wave_status: 'PASS' | 'FAIL' | 'ERROR' | 'DRY-RUN';
+  /** Re-book submits made during the hold. */
+  hold_submits: number;
 }
 
 export interface BookingResult {
@@ -60,6 +83,8 @@ export interface BookingResult {
   duration_ms: number;
   /** Full trail of (court, slot) attempts — useful for post-mortem and tuning. */
   attempts: AttemptRecord[];
+  /** Set when the wipe guard decided the final status. */
+  verification?: BookingVerification;
 }
 
 export interface FlowOptions {
@@ -120,6 +145,14 @@ export interface FlowOptions {
    * Note: engine owns the context (same as prewarmedBookingPage).
    */
   loginReadyPage?: Page;
+  /**
+   * The batch's post-noon wipe guard (src/wipeGuard.ts). When set (and not a
+   * dry run) a PASS/FAIL from the first wave is provisional: holdForWipe
+   * watches reservations.php until the hold window ends, re-books if the
+   * account's row disappears, and decides the final status from the list. The
+   * §7 proof (reservations.php + screenshot) moves to after the hold.
+   */
+  wipeGuard?: WipeGuard;
 }
 
 const LOGIN_URL = 'https://susport.sc.su.ac.th/login.php';
@@ -713,14 +746,20 @@ async function confirmViaReservationsIfUnclear(
  * POST the form, classify the response (alerts included), and double-check
  * reservations on anything that is not a clear success. The page never
  * navigates, so the caller can retry the next court with no reset/goto.
+ *
+ * `confirm: false` skips that reservations double-check — for the wipe-guard
+ * hold, which re-reads the whole list before it ever submits again.
  */
 async function attemptBookingFetch(
   page: Page,
   court: CourtInfo,
   slot: string,
   username: string,
-  preselected = false
+  preselected = false,
+  opts: { confirm?: boolean; tag?: string } = {}
 ): Promise<AttemptOutcome> {
+  const confirm = opts.confirm ?? true;
+  const tag = opts.tag ?? 'fetch_submit';
   const t0 = Date.now();
   const res = await setSelectionAndSubmitViaFetch(
     page,
@@ -737,18 +776,18 @@ async function attemptBookingFetch(
     // No answer within the ceiling — but the POST may still have been
     // accepted server-side. Check reservations BEFORE the caller moves on to
     // another court, or a slow success becomes a double booking.
-    const outcome = await confirmViaReservationsIfUnclear(page, username, failed);
+    const outcome = confirm ? await confirmViaReservationsIfUnclear(page, username, failed) : failed;
     console.log(
-      `[perf] ${username} fetch_submit court=${court.label} slot=${slot} ` +
+      `[perf] ${username} ${tag} court=${court.label} slot=${slot} ` +
         `post=${Date.now() - t0}ms status=- outcome=${outcome.type} (${SUBMIT_TIMEOUT_ERROR})`
     );
     return outcome;
   }
   const alerts = extractAlertMessages(res.text ?? '');
   let outcome = classifyOutcome(res.url ?? page.url(), res.text ?? '', username, alerts);
-  outcome = await confirmViaReservationsIfUnclear(page, username, outcome);
+  if (confirm) outcome = await confirmViaReservationsIfUnclear(page, username, outcome);
   console.log(
-    `[perf] ${username} fetch_submit court=${court.label} slot=${slot} ` +
+    `[perf] ${username} ${tag} court=${court.label} slot=${slot} ` +
       `post=${Date.now() - t0}ms status=${res.status ?? '-'} outcome=${outcome.type}`
   );
   return outcome;
@@ -809,9 +848,16 @@ async function recordActualCourt(
       const cells = rows
         .map((r) => Array.from(r.querySelectorAll('td')).map((c) => (c.textContent ?? '').trim()))
         .filter((c) => c.length > courtCol);
+      // With a user column, only OUR row counts. (It used to fall back to "the
+      // only row" — but the list is global: after the post-noon wipe that one
+      // row can be someone else's, and adopting it would also have taught the
+      // court-id cache a wrong pair.)
       const mine =
-        cells.find((c) => userCol >= 0 && c[userCol] === user) ??
-        (cells.length === 1 ? cells[0] : undefined);
+        userCol >= 0
+          ? cells.find((c) => c[userCol] === user)
+          : cells.length === 1
+            ? cells[0]
+            : undefined;
       return mine ? mine[courtCol] : null;
     }, username);
   } catch {
@@ -1053,6 +1099,222 @@ export function buildCourtPriority(
   return out;
 }
 
+// ---------- post-noon wipe hold (see src/wipeGuard.ts) ----------
+
+/** Re-book submits one account may spend inside the hold window. */
+const HOLD_MAX_SUBMITS = 6;
+
+/** Fetch mode posts the page's own form, so a re-book needs booking.php. */
+async function ensureBookingForm(page: Page): Promise<boolean> {
+  if (submitVia() === 'click') return true; // attemptSubmitBooking resets itself
+  if (page.url().includes('booking.php')) return true;
+  try {
+    await page.goto(new URL('booking.php', page.url()).toString(), {
+      waitUntil: 'domcontentloaded',
+      timeout: 10_000,
+    });
+    await page.waitForSelector('#court', { timeout: 5_000 });
+    return page.url().includes('booking.php');
+  } catch {
+    return false;
+  }
+}
+
+/** One re-book submit inside the hold. No reservations double-check: the hold
+ *  reads the whole list again before it submits anything else. */
+async function attemptHoldBooking(
+  page: Page,
+  court: CourtInfo,
+  slot: string,
+  username: string
+): Promise<AttemptOutcome> {
+  if (submitVia() === 'click') {
+    await resetToBookingPage(page).catch(() => {});
+    return attemptSubmitBooking(page, court, slot, username);
+  }
+  return attemptBookingFetch(page, court, slot, username, false, {
+    confirm: false,
+    tag: 'hold_submit',
+  });
+}
+
+/** Short Thai label for a failed hold submit (DM-sized). */
+function holdFailLabel(court: string, reason: string): string {
+  const kind = failKind(reason);
+  if (kind === 'race-loss') return `${court} มีคนจองก่อน`;
+  if (kind === 'db-error') return `${court} เว็บบันทึกไม่ได้`;
+  return `${court} ${reason.replace(/\s+/g, ' ').slice(0, 60)}`;
+}
+
+/**
+ * After the first wave: hold until the guard's window closes, watching our
+ * row in reservations.php. A missing row — wiped by the site, or never
+ * booked — means submit again on the first free working court. The final
+ * status comes from the list itself: PASS only when our row is in it.
+ *
+ * Never submits while a list requested after our last answered submit still
+ * shows our row, so it cannot stack a second booking on a live one. Mutates
+ * `result`; never throws past its caller's catch.
+ */
+async function holdForWipe(
+  page: Page,
+  result: BookingResult,
+  account: Account,
+  guard: WipeGuard,
+  firstBooked: { label: string; value?: string } | null
+): Promise<void> {
+  const user = account.username;
+  const firstWave = result.status;
+  const firstReason = result.fail_reason;
+  let booked = firstWave === 'PASS' ? firstBooked : null;
+  guard.register(user, page);
+  for (const t of result.attempts) {
+    if (t.outcome === 'success') guard.noteAttempt(t.court, 'success');
+    else if (t.outcome === 'submit-fail') guard.noteAttempt(t.court, failKind(t.reason));
+  }
+
+  let lastActionEnd = Date.now();
+  // Newest list already handled. Every wait must be for a NEWER one: waiting
+  // again on the same `after` hands back the same snapshot at once, and that
+  // loop never leaves the microtask queue — timers (the hold deadline
+  // included) and I/O starve and the whole process hangs.
+  let seenUpTo = lastActionEnd;
+  let submits = 0;
+  let wipes = 0;
+  let firstWipeSeenAt: number | null = null;
+  let serverSaysBooked = false;
+  let lastFail: string | null = null;
+
+  for (;;) {
+    const snap = await guard.nextSnapshot(seenUpTo);
+    if (!snap) break; // hold window over
+    seenUpTo = snap.issuedAt;
+    if (snap.rows.some((r) => r.user === user)) continue; // ours is there — keep watching
+
+    // A list requested after our last answered submit has no row for us.
+    if (booked) {
+      wipes += 1;
+      firstWipeSeenAt ??= snap.issuedAt;
+      console.warn(
+        `[wipe] ${user} row gone at +${guard.since(snap.issuedAt)}ms ` +
+          `(had ${booked.label}/${account.slot}) — re-booking`
+      );
+      result.attempts.push({
+        court: booked.label,
+        slot: account.slot,
+        outcome: 'wiped',
+        reason: `row gone at +${guard.since(snap.issuedAt)}ms`,
+      });
+      booked = null;
+    }
+    if (serverSaysBooked || submits >= HOLD_MAX_SUBMITS) continue;
+    const courts = guard.candidatesFor(user, snap);
+    if (courts.length === 0) continue; // slot taken everywhere — wait for the list to change
+
+    guard.setBusy(user, true);
+    try {
+      if (!(await ensureBookingForm(page))) {
+        lastFail = 'เปิดหน้าจองไม่ได้';
+        continue;
+      }
+      for (const court of courts) {
+        if (submits >= HOLD_MAX_SUBMITS) break;
+        submits += 1;
+        const outcome = await attemptHoldBooking(page, court, account.slot, user);
+        if (outcome.type === 'success') {
+          guard.noteAttempt(court.label, 'success');
+          result.attempts.push({ court: court.label, slot: account.slot, outcome: 'success', reason: 'hold' });
+          booked = { label: court.label, value: court.value };
+          break;
+        }
+        if (outcome.type === 'already-booked') {
+          // The site says we hold a booking; the next list must show it.
+          // Never submit again this hold.
+          serverSaysBooked = true;
+          result.attempts.push({
+            court: court.label,
+            slot: account.slot,
+            outcome: 'submit-fail',
+            reason: 'hold: already-booked',
+          });
+          break;
+        }
+        const reason = outcome.type === 'submit-fail' ? outcome.reason : outcome.type;
+        const kind = failKind(reason);
+        guard.noteAttempt(court.label, kind);
+        result.attempts.push({
+          court: court.label,
+          slot: account.slot,
+          outcome: 'submit-fail',
+          reason: `hold: ${reason}`,
+        });
+        lastFail = holdFailLabel(court.label, reason);
+        // Lost race / DB error: provably not booked — next court now.
+        // Anything else is unclear: re-read the list before submitting again.
+        if (kind !== 'race-loss' && kind !== 'db-error') break;
+      }
+    } finally {
+      guard.setBusy(user, false);
+      lastActionEnd = Date.now();
+      seenUpTo = lastActionEnd; // the next list must postdate our submits
+    }
+  }
+
+  // ---- verdict: the list as it stands now ----
+  const snap = guard.latestAfter(lastActionEnd) ?? (await fetchReservationSnapshot(page));
+  const mine = snap?.rows.find((r) => r.user === user) ?? null;
+  result.verification = {
+    checked_at: new Date(snap?.issuedAt ?? Date.now()).toISOString(),
+    row: mine ? { court: mine.court, slot: mine.slot, no: mine.no } : null,
+    wipe_detected_at: guard.wipeAt === null ? null : new Date(guard.wipeAt).toISOString(),
+    first_wave_status: firstWave,
+    hold_submits: submits,
+  };
+  if (!snap) {
+    console.warn(
+      `[verify] ${user} reservations.php unreadable at +${guard.since()}ms — ` +
+        `${result.status} left unverified`
+    );
+    return;
+  }
+  if (mine) {
+    if (booked && booked.label !== mine.court) {
+      // Same lesson as recordActualCourt: the submitted id belongs to the
+      // court the list shows.
+      console.warn(
+        `[bookingFlow] ${user} submitted ${booked.label} (id=${booked.value ?? '?'}) ` +
+          `but reservations.php shows ${mine.court} — reporting ${mine.court}`
+      );
+      if (booked.value) updateCourtIds([{ label: mine.court, value: booked.value }]);
+    }
+    result.status = 'PASS';
+    result.court_booked = mine.court;
+    result.fail_reason = null;
+  } else {
+    result.status = 'FAIL';
+    result.court_booked = null;
+    const at = firstWipeSeenAt ?? guard.wipeAt;
+    const when = at === null ? '' : ` (+${(guard.since(at) / 1000).toFixed(1)}s)`;
+    if (serverSaysBooked) {
+      result.fail_reason = 'เว็บตอบว่าจองวันนี้แล้ว แต่ไม่พบชื่อใน reservations.php — ให้เช็คหน้าเว็บ';
+    } else if (wipes > 0) {
+      result.fail_reason =
+        `การจองถูกเว็บลบหลังเที่ยง${when} — จองใหม่ไม่สำเร็จ: ` +
+        (lastFail ?? 'ไม่มีสนามว่าง');
+    } else if (firstWave === 'PASS') {
+      result.fail_reason = `ไม่พบการจองใน reservations.php (ตรวจที่ +${(guard.since(snap.issuedAt) / 1000).toFixed(1)}s)`;
+    } else {
+      result.fail_reason =
+        submits > 0 && lastFail ? `${firstReason}; หลังเว็บล้าง: ${lastFail}` : firstReason;
+    }
+  }
+  console.log(
+    `[verify] ${user} ${result.status} row=${mine ? `${mine.court}/${mine.slot}#${mine.no}` : '-'} ` +
+      `at +${guard.since(snap.issuedAt)}ms (first wave ${firstWave}` +
+      `${wipes ? `, wiped x${wipes}` : ''}${submits ? `, ${submits} hold submit(s)` : ''})`
+  );
+}
+
 // ---------- main entry ----------
 
 export async function bookOneAccount(
@@ -1087,6 +1349,43 @@ export async function bookOneAccount(
   let page: Page | null = null;
   const deepPrewarmed = options.prewarmedBookingPage !== undefined;
 
+  // Wipe guard (src/wipeGuard.ts): with it, the first wave's PASS/FAIL is
+  // provisional and the §7 proof waits for the hold — the page must stay on
+  // booking.php so a re-book can submit at once. Without it (CLI, tests,
+  // WIPE_GUARD=0) every exit behaves exactly as before.
+  const guard = options.dryRun ? undefined : options.wipeGuard;
+  let lastBooked: { label: string; value?: string } | null = null;
+  const proofPass = async (p: Page, label: string, value: string | undefined): Promise<void> => {
+    lastBooked = { label, value };
+    if (guard) return;
+    if (!p.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(p);
+    await recordActualCourt(p, result, account.username, value);
+    await shoot(p, screenshot);
+  };
+  const proofFail = async (p: Page): Promise<void> => {
+    if (!guard) await shoot(p, screenshot);
+  };
+  /** Every PASS/FAIL exit of a logged-in account goes through here. */
+  const finish = async (): Promise<BookingResult> => {
+    if (!guard || !page) return result;
+    if (result.status === 'PASS' || result.status === 'FAIL') {
+      try {
+        await holdForWipe(page, result, account, guard, lastBooked);
+      } catch (err) {
+        console.warn(`[wipe] ${account.username} hold aborted (${err}) — first-wave result kept`);
+      }
+    }
+    guard.release(account.username);
+    // Deferred §7 proof: the reservations list as it stands after the hold.
+    try {
+      if (!page.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(page);
+      await shoot(page, screenshot);
+    } catch {
+      /* best-effort — a failed screenshot must not turn a verified result into ERROR */
+    }
+    return result;
+  };
+
   try {
     // ---- Deep-prewarm fast path ----
     // The engine already verified and selected (court, slot) at T-5min. There
@@ -1098,15 +1397,15 @@ export async function bookOneAccount(
       if (!page.url().includes('booking.php')) {
         result.status = 'FAIL';
         result.fail_reason = `deep-prewarm: page not on booking.php (${page.url()})`;
-        if (!options.dryRun) await shoot(page, screenshot);
-        return result;
+        if (!options.dryRun) await proofFail(page);
+        return await finish();
       }
       const courtLabel = options.prewarmedCourtLabel ?? priorityCourts[0];
       if (!courtLabel) {
         result.status = 'FAIL';
         result.fail_reason = 'deep-prewarm: selected court label missing';
-        if (!options.dryRun) await shoot(page, screenshot);
-        return result;
+        if (!options.dryRun) await proofFail(page);
+        return await finish();
       }
 
       if (options.dryRun) {
@@ -1142,10 +1441,8 @@ export async function bookOneAccount(
         result.court_booked = courtLabel;
         result.status = 'PASS';
         result.fail_reason = null;
-        if (!page.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(page);
-        await recordActualCourt(page, result, account.username, options.prewarmedCourtValue);
-        await shoot(page, screenshot);
-        return result;
+        await proofPass(page, courtLabel, options.prewarmedCourtValue);
+        return await finish();
       }
       if (outcome.type === 'already-booked') {
         result.attempts.push({
@@ -1156,8 +1453,8 @@ export async function bookOneAccount(
         });
         result.status = 'FAIL';
         result.fail_reason = 'server: already booked today';
-        await shoot(page, screenshot);
-        return result;
+        await proofFail(page);
+        return await finish();
       }
 
       result.attempts.push({
@@ -1211,10 +1508,8 @@ export async function bookOneAccount(
           result.court_booked = cachedTarget.label;
           result.status = 'PASS';
           result.fail_reason = null;
-          if (!page.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(page);
-          await recordActualCourt(page, result, account.username, cachedTarget.value);
-          await shoot(page, screenshot);
-          return result;
+          await proofPass(page, cachedTarget.label, cachedTarget.value);
+          return await finish();
         }
         if (outcome.type === 'already-booked') {
           result.attempts.push({
@@ -1225,8 +1520,8 @@ export async function bookOneAccount(
           });
           result.status = 'FAIL';
           result.fail_reason = 'server: already booked today';
-          await shoot(page, screenshot);
-          return result;
+          await proofFail(page);
+          return await finish();
         }
         result.attempts.push({
           court: cachedTarget.label,
@@ -1267,8 +1562,8 @@ export async function bookOneAccount(
     if (page.url().includes('reservations.php')) {
       result.status = 'FAIL';
       result.fail_reason = 'already booked today (reservations.php after login)';
-      if (!options.dryRun) await shoot(page, screenshot);
-      return result;
+      if (!options.dryRun) await proofFail(page);
+      return await finish();
     }
     if (!page.url().includes('booking.php')) {
       result.status = 'FAIL';
@@ -1436,23 +1731,23 @@ export async function bookOneAccount(
       if (options.dryRun) {
         result.status = 'DRY-RUN';
         result.fail_reason = `would book ${booked.court}/${booked.slot} (submit skipped)`;
-      } else {
-        result.status = 'PASS';
-        result.fail_reason = null;
-        // Fetch submits never navigate — park on reservations.php so the §7
-        // proof screenshot shows the booking row.
-        if (!page.url().includes(RESERVATIONS_URL_MARKER)) await gotoReservationsProof(page);
-        await recordActualCourt(page, result, account.username, booked.value);
+        await shoot(page, screenshot);
+        return result;
       }
-      await shoot(page, screenshot);
-      return result;
+      result.status = 'PASS';
+      result.fail_reason = null;
+      // Fetch submits never navigate — proofPass parks on reservations.php so
+      // the §7 proof screenshot shows the booking row (after the hold, with
+      // the wipe guard).
+      await proofPass(page, booked.court, booked.value);
+      return await finish();
     }
 
     if (earlyExit === 'already-booked') {
       result.status = 'FAIL';
       result.fail_reason = 'server: already booked today';
-      if (!options.dryRun) await shoot(page, screenshot);
-      return result;
+      if (!options.dryRun) await proofFail(page);
+      return await finish();
     }
 
     // Exhausted all (court, slot) combinations within deadline.
@@ -1475,8 +1770,8 @@ export async function bookOneAccount(
       result.fail_reason = `no available (court, slot) within ${Math.round(deadlineMs / 1000)}s${trail}`;
       result.court_attempted = priorityCourts[0] ?? account.court ?? '';
     }
-    if (!options.dryRun) await shoot(page, screenshot);
-    return result;
+    if (!options.dryRun) await proofFail(page);
+    return await finish();
   } catch (err) {
     result.status = 'ERROR';
     result.fail_reason = `${err}`;
@@ -1492,6 +1787,9 @@ export async function bookOneAccount(
     return result;
   } finally {
     result.duration_ms = Date.now() - start;
+    // Stop lending the page to the wipe poller BEFORE our context can close
+    // (no-op when the hold already released it, or never registered it).
+    guard?.release(account.username);
     // Cleanup off the critical path: browser teardown is where ~11 minutes
     // disappeared after bookings finished on 2026-08-22. close() is still
     // invoked on every exit path (BR-02), but detached + timed so a hung close
