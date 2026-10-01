@@ -6,27 +6,28 @@
 ## 1. ภาพรวม (Overview)
 
 ระบบ Playwright automation สำหรับจองสนามแบดมินตันบนเว็บ `https://susport.sc.su.ac.th/login.php`  
-รัน **9 accounts พร้อมกัน (parallel)** ทุกครั้งที่ถึงเวลา **12:00:00 น. ตรง** ของวันที่กดรัน
+รัน **ทุก account พร้อมกัน (parallel)** ที่เวลา **12:00:00 น. ตรง**
+
+ใช้งานได้ 2 ทาง:
+- **Telegram bot (production)** — `npm run bot` รันค้างไว้ผ่าน launchd ทุกวัน cron 11:55 จะ prewarm แล้วจองให้ทุก account ของ user ที่เลือกจองรอบนั้น (owner + friends ใน `config/users.json`; ณ 2026-10 มี 17 account) ใน batch เดียว ส่งผลกลับทาง Telegram DM — รายละเอียดใน §6.2 และ §10.11
+- **CLI** — `npm start` รอจนถึงเที่ยงแล้วจองบัญชีใน `config/accounts.json` (flow เดิมของ spec, ใช้ debug)
 
 ---
 
 ## 2. Credentials & Time Assignment
 
-| # | Username    | Password    | เวลาที่จอง (slot) |
-|---|-------------|-------------|-------------------|
-| 1 | `<username>`| `<password>`| TBD               |
-| 2 | `<username>`| `<password>`| TBD               |
-| 3 | `<username>`| `<password>`| TBD               |
-| 4 | `<username>`| `<password>`| TBD               |
-| 5 | `<username>`| `<password>`| TBD               |
-| 6 | `<username>`| `<password>`| TBD               |
-| 7 | `<username>`| `<password>`| TBD               |
-| 8 | `<username>`| `<password>`| TBD               |
-| 9 | `<username>`| `<password>`| TBD               |
+แต่ละ account มี `username`, `password` และ `slot` ของตัวเอง (รูปแบบ `HH:MM_HH:MM` เช่น `18:30_19:30`) — หลาย account ใช้ slot เดียวกันได้ (ดูการหมุนลำดับสนามใน §3.4)
 
-> **หมายเหตุ:** คอลัมน์ "เวลาที่จอง" ต้องระบุก่อน implement — แต่ละ account จะได้ slot เวลาที่ต่างกัน
->
-> **Security:** credentials จริงเก็บใน `config/accounts.json` เท่านั้น (ไฟล์นี้ใช้ placeholders สำหรับ public spec)
+| ไฟล์ | เก็บอะไร | ใช้โดย |
+|------|----------|--------|
+| `config/users.json` | user ของ bot: `role` (`owner` / `friend`), `chat_id`, cron on/off, `pending_booking`, และ `accounts[]` (username / password / slot) ของแต่ละ user — template: `config/users.example.json` | Telegram bot |
+| `config/accounts.json` | top-level `COURT_PRIORITY` (ลำดับสนามของทุก account) + `accounts[]` | `COURT_PRIORITY`: ทั้ง bot และ CLI · `accounts[]`: CLI เท่านั้น |
+
+- ณ 2026-10 ทุก account มี slot แล้ว (ไม่มี `TBD`) — owner 9 + friend 8 ใน `users.json`
+- bot อ่าน `users.json` ใหม่เมื่อ mtime เปลี่ยน ไม่ต้อง restart แต่ต้องบันทึกก่อน cron 11:55 (§10.11)
+- per-account `court` เป็น `@deprecated` — ลำดับสนามมาจาก `COURT_PRIORITY` เท่านั้น (§10.4)
+
+> **Security:** credentials จริงเก็บใน `config/users.json` / `config/accounts.json` เท่านั้น (ทั้งคู่ gitignored — ไฟล์นี้ไม่มี credential)
 
 ---
 
@@ -40,7 +41,9 @@
 | SC-02 | ถ้ากดก่อนเที่ยง → หน้าจอแสดง countdown และรอจนถึง **12:00:00 น. ตรงพอดี** |
 | SC-03 | ถ้ากดหลังเที่ยงแล้ว → แจ้ง "เลยเวลาแล้ว" และถามว่าจะรอพรุ่งนี้หรือรันทันที |
 | SC-04 | **ไม่มี tolerance** — trigger ที่ 12:00:00 เท่านั้น |
-| SC-05 | เมื่อถึงเวลา ให้ปล่อย 9 browser context พร้อมกันทันที (parallel launch) |
+| SC-05 | เมื่อถึงเวลา ให้ปล่อยทุก account พร้อมกันทันที (parallel launch) |
+
+> SC-02 / SC-03 ใช้กับ CLI (`npm start`): ถ้าเลยเที่ยงแล้วจะเล็ง 12:00 ของพรุ่งนี้อัตโนมัติแทนการถาม และ `npm run now` (`--now`) = รันทันที. โหมด bot ไม่มีปุ่ม Run: cron ยิงเองทุกวัน 11:55 เพื่อ prewarm แล้ว dispatch ที่ 12:00:00.000 ตรง — ถ้าเครื่องตื่นสายเกิน 30s ไม่ยิง (FAIL `missed-deadline`) และไม่จองย้อนหลัง (§6.2, §10.8)
 
 ### 3.2 Browser Isolation
 
@@ -92,7 +95,9 @@ ABORT       → slot taken in every court: status = FAIL with reason
               "slot {slot} ไม่ว่างในทุกสนาม"
 ```
 
-**Deep-prewarm invariant (T-5min):** ก่อนถึงเที่ยง ทุก account ต้องมี (priority/safety-net court, assigned-slot) ที่ยังว่างอย่างน้อย 1 court ถ้าไม่มีเลย → ABORT deep prewarm + loud alert (console + Telegram DM to owner)
+**Same-slot rotation (de-confliction):** account ที่ใช้ slot เดียวกันได้ลำดับสนามแบบ **หมุน** ตามตำแหน่งในกลุ่ม — คนที่ 0 เริ่มที่ `COURTS[0]`, คนที่ 1 เริ่มที่ `COURTS[1]`, … วนกลับ. ทุกคนยังได้ลำดับครบทุกสนาม (coverage ข้างบนไม่เปลี่ยน) ต่างกันแค่จุดเริ่ม — ใช้ลำดับนี้ทั้งตอน prewarm, ตอนยิงเที่ยง, retry loop และ re-book หลังเว็บล้าง (§10.10, §10.11)
+
+**Pre-reset heads-up (T-5min):** ถ้าข้อมูลตอน prewarm บอกว่า slot ของ account ไหนเต็มทุกสนาม → DM แจ้ง owner เป็น **ข้อมูลเท่านั้น** แล้วยิงตามปกติทุก account. ข้อมูลก่อนเที่ยงยังเป็นของเมื่อวานและถูก reset ตอน 12:00 จึงไม่ใช้ตัดสินอะไร (เดิมเป็น ABORT deep prewarm — ยกเลิกแล้ว ดู §10.11)
 
 **Retry budget:** สูงสุด **30 วินาที** ต่อ account (เริ่มนับหลัง login เสร็จ) — ถ้าเกินจะหยุด loop และบันทึก FAIL
 
@@ -111,13 +116,16 @@ ABORT       → slot taken in every court: status = FAIL with reason
 
 | Component | ค่าที่กำหนด |
 |-----------|-------------|
-| Language | TypeScript (Node.js) |
-| Automation | Playwright |
-| Parallelism | `Promise.all()` — 9 context พร้อมกัน |
-| Browser | Chromium (Playwright built-in) หรือ `channel: 'chrome'` |
-| Scheduler | Node.js native — `setTimeout` คำนวณจาก `Date` |
-| Config | `accounts.json` แยก credential + slot ออกจาก code |
-| Report | JSON + HTML (Playwright HTML reporter) + screenshot on fail |
+| Language | TypeScript (Node.js, รันด้วย `ts-node`) |
+| Automation | Playwright — `channel: 'chrome'`, headless |
+| Parallelism | browser เดียว, `BrowserContext` ใหม่ต่อ account, `Promise.all()` ยิงทุก account ของทุก user ใน tick เดียว |
+| Scheduler | bot: `node-cron` `55 11 * * *` (เปิด prewarm) + `waitUntilLocalTimestamp` รอ 12:00:00.000 ตรง · CLI: `setTimeout` คำนวณจาก `Date` |
+| Interface | Telegram bot — long-poll ด้วย Bot API ตรง + `sendTelegramMessage` (§10.1) |
+| Config | `config/users.json` + `config/accounts.json` (`COURT_PRIORITY`) แยก credential / slot / ลำดับสนามออกจาก code; `config/court-ids.json` = cache id สนาม; `.env` = token, `TZ=Asia/Bangkok`, kill-switch |
+| Report | `reports/bot-run-<ISO>.json` (§7 + §10.7) + `screenshots/<YYYY-MM-DD>/<username>.png` ทุก account + DM ราย user + สรุปให้ owner |
+| Tests | สคริปต์ `ts-node` กับ mock server ใน `node:http` (`npm run test:log-audit`, `test:wipe`, `test:fast-confirm`, `bot:test-wizards`) — ไม่แตะเว็บจริงและ Telegram; ไม่ใช้ Playwright Test runner |
+
+Kill-switch ใน `.env`: `DEEP_PREWARM=0` (ไม่ prewarm, login เต็มตอนเที่ยง), `WIPE_GUARD=0` / `WIPE_HOLD_SEC` (§10.10), `SUBMIT_VIA=click` (กดปุ่มจริงแทน fetch POST), `PREWARM_LEAD_SEC` (default 300)
 
 ---
 
@@ -126,38 +134,51 @@ ABORT       → slot taken in every court: status = FAIL with reason
 ```
 court-booking-bot/
 ├── package.json
-├── playwright.config.ts
 ├── config/
-│   └── accounts.json          ← credentials + เวลาจองของแต่ละ account
+│   ├── users.json             ← user ของ bot + account (credential + slot) — gitignored
+│   ├── users.example.json
+│   ├── accounts.json          ← COURT_PRIORITY + account ของ CLI — gitignored
+│   ├── court-ids.json         ← cache label → id ของสนาม
+│   └── run-state.json         ← วันที่ cron ยิง / dispatch (watchdog) — gitignored
 ├── src/
-│   ├── scheduler.ts           ← รอเที่ยงตรงแล้ว trigger
-│   ├── runner.ts              ← Promise.all() ปล่อย 9 context พร้อมกัน
-│   └── bookingFlow.ts         ← flow login → เลือกสนาม → จอง ของ 1 account
-├── reports/
-│   └── (auto-generated)
-└── screenshots/
-    └── (auto-generated on fail)
+│   ├── server/
+│   │   ├── bot.ts             ← คำสั่ง Telegram, cron 11:55, runScheduledBooking, watchdog
+│   │   ├── bookingEngine.ts   ← runPrewarmedBatch (prewarm → tick → dispatch) / runStandard
+│   │   ├── runReport.ts       ← §7 JSON report + retention 30 วัน
+│   │   ├── runState.ts        ← สถานะสำหรับ missed-noon watchdog
+│   │   ├── userStore.ts       ← อ่าน/เขียน users.json
+│   │   ├── configLoader.ts    ← อ่าน accounts.json / COURT_PRIORITY
+│   │   ├── telegramSend.ts, botLog.ts, rehearse.ts
+│   │   └── test*.ts           ← ชุดทดสอบ mock
+│   ├── bookingFlow.ts         ← bookOneAccount: login → เลือกสนาม → submit → verify (+ holdForWipe)
+│   ├── wipeGuard.ts           ← เฝ้า reservations.php หลังเที่ยง (§10.10)
+│   ├── courtIdCache.ts
+│   ├── scheduler.ts           ← CLI: รอเที่ยงตรงแล้ว trigger
+│   └── runner.ts              ← CLI: Promise.all() ของ accounts.json
+├── reports/                   ← bot-run-*.json (auto-generated)
+├── screenshots/<YYYY-MM-DD>/  ← 1 รูปต่อ account ทั้ง PASS และ FAIL
+└── bot.log
 ```
 
 ### ตัวอย่าง `config/accounts.json`
 
 ```json
-[
-  { "username": "<username>", "password": "<password>", "slot": "TBD" },
-  { "username": "<username>", "password": "<password>", "slot": "TBD" },
-  { "username": "<username>", "password": "<password>", "slot": "TBD" },
-  { "username": "<username>", "password": "<password>", "slot": "TBD" },
-  { "username": "<username>", "password": "<password>", "slot": "TBD" },
-  { "username": "<username>", "password": "<password>", "slot": "TBD" },
-  { "username": "<username>", "password": "<password>", "slot": "TBD" },
-  { "username": "<username>", "password": "<password>", "slot": "TBD" },
-  { "username": "<username>", "password": "<password>", "slot": "TBD" }
-]
+{
+  "COURT_PRIORITY": ["แบดมินตัน2", "แบดมินตัน1"],
+  "accounts": [
+    { "username": "<username>", "password": "<password>", "slot": "18:30_19:30" },
+    { "username": "<username>", "password": "<password>", "slot": "19:30_20:30" }
+  ]
+}
 ```
+
+`config/users.json` ใช้โครงตาม `config/users.example.json` (`users[]` → `role`, `chat_id`, `display_name`, `accounts[]`)
 
 ---
 
 ## 6. Scheduler Logic (ละเอียด)
+
+### 6.1 CLI (`npm start`) — แนวคิดของ `src/scheduler.ts`
 
 ```typescript
 async function waitUntilNoonThenRun(): Promise<void> {
@@ -184,6 +205,21 @@ async function waitUntilNoonThenRun(): Promise<void> {
 }
 ```
 
+### 6.2 Telegram bot (production) — `src/server/bot.ts` + `src/server/bookingEngine.ts`
+
+| เวลา (T = 12:00:00.000) | ขั้น | รายละเอียด |
+|---|---|---|
+| 11:55 | cron ยิง | เลือก user: owner (cron on) + friend ที่ cron on + friend ที่ cron off แต่ส่ง `/book` รอบนี้; DM แจ้งล่วงหน้าให้คนที่ cron on; ใครปิด cron ระหว่างนี้ → ข้าม + DM |
+| 11:55 | alarm + เปิด Chrome | ตั้ง timer T-4m ก่อน `chromium.launch()` — ถ้าทุก account ล้ม → DM owner (§10.11) |
+| T-5m → T-40s | prewarm | ทุก account login ใน context ใหม่พร้อมกัน → `page-ready` / `login-ready` / `needs-standard` / `failed`; `failed` retry ทุก 30s; ถึง T-40s ยังล้มหมด → เปิด Chrome ใหม่ (§10.6, §10.11) |
+| T-40s → T | ล็อกเป้าหมาย | heads-up ข้อมูลก่อน reset (§3.4), กำหนดสนามของแต่ละ account, สร้าง wipe guard — หลัง T ไม่มีงานอื่นนอกจาก dispatch |
+| T | dispatch | `bookOneAccount` ของทุก account ใน tick เดียว; ตื่นสายเกิน 30s → ไม่ยิง, FAIL `missed-deadline` |
+| T+1s → T+10s | wipe hold | เฝ้า reservations.php, account ที่ถูกลบจองใหม่; PASS ต้องเจอชื่อใน list (§10.10) |
+| ≤ T+90s | รายงาน | DM ราย user ทันทีที่ account ของ user นั้นจบ (เกิน 90s → `ERROR`, §10.5), JSON report (§10.7), สรุปให้ owner; ปิด Chrome แบบ detached |
+| ตั้งแต่ 12:05 | watchdog | วันนี้ยังไม่ dispatch ทั้งที่มี user เปิด cron → DM owner วันละครั้ง (§10.8) |
+
+`DEEP_PREWARM=0` → ข้าม prewarm: รอ T แล้ว login + จองทุก account แบบ standard (`runStandard`)
+
 ---
 
 ## 7. Report Requirements
@@ -194,41 +230,43 @@ async function waitUntilNoonThenRun(): Promise<void> {
 |-------|----------|
 | `username` | account ที่รัน |
 | `triggered_at` | timestamp จริงที่เริ่ม (ควรเป็น 12:00:00.xxx) |
-| `court_attempted` | แบดมินตัน1 หรือ แบดมินตัน4 |
-| `court_booked` | สนามที่จองได้จริง |
+| `court_attempted` | สนามแรกที่ลอง — หัวลำดับ `COURT_PRIORITY` ที่หมุนแล้วของ account นั้น (§3.4) |
+| `court_booked` | สนามที่จองได้จริง — อ่านจากคอลัมน์ สนาม ใน reservations.php ไม่ใช่จาก id ที่ส่งไป (§10.10) |
 | `slot` | เวลาที่จอง |
 | `status` | `PASS` / `FAIL` / `ERROR` |
-| `fail_reason` | เหตุผลถ้า fail (เช่น "ทั้ง 2 สนามเต็ม", "login failed") |
-| `screenshot` | path ของ screenshot (บันทึกเสมอทั้ง pass และ fail) |
+| `fail_reason` | เหตุผลถ้า fail เช่น `slot {slot} ไม่ว่างในทุกสนาม`, `login failed (…)`, `server: already booked today`, `missed-deadline: …`, `การจองถูกเว็บลบหลังเที่ยง (+2.1s) — จองใหม่ไม่สำเร็จ: …` |
+| `screenshot` | path ของ screenshot `screenshots/<YYYY-MM-DD>/<username>.png` (บันทึกเสมอทั้ง pass และ fail; โหมด bot ถ่าย reservations.php หลังจบ wipe hold) |
 | `duration_ms` | เวลาที่ใช้ทั้งหมดต่อ account |
+
+โหมด bot เขียน field เหล่านี้ลง `reports/bot-run-<fire ISO>.json` พร้อม field เสริมระดับรอบ (`fired_at`, `drift_ms`, `mode`, `prewarm` tallies, …) และต่อ account (`attempts`, `verification`) — ดู §10.7 และ §10.10
 
 ---
 
 ## 8. Acceptance Criteria
 
 - [ ] รันเที่ยงตรง 12:00:00 น. พอดี — ไม่มี tolerance
-- [ ] 9 accounts เริ่มพร้อมกัน (parallel) ภายใน millisecond เดียวกัน
+- [ ] ทุก account ของทุก user เริ่มพร้อมกัน (parallel) ใน tick เดียว — account ที่ช้าไม่ถ่วงคนอื่น
 - [ ] แต่ละ account ได้ BrowserContext ใหม่แยกกัน (ไม่ share cookie/session)
 - [ ] Court priority อยู่ที่ top-level `COURT_PRIORITY` ใน config/accounts.json (ไม่ hardcode ใน code)
-- [ ] Deep prewarm abort + loud alert ถ้า account ไหรไม่มี priority court ที่ slot ตัวเองว่าง ณ T-5min
+- [ ] account ที่ slot เดียวกันได้ลำดับสนามแบบหมุน (§3.4)
+- [ ] Pre-reset heads-up DM ถึง owner เมื่อข้อมูล T-5min บอกว่า slot เต็มทุกสนาม — ไม่เปลี่ยนการยิง (§3.4, §10.11)
 - [ ] Per-court slot fallback ปิด — ลองเฉพาะ slot ของ account เท่านั้น
 - [ ] แต่ละ account จองเวลา slot ของตัวเองตาม config
 - [ ] บันทึก screenshot ทุก account ทั้ง PASS และ FAIL
-- [ ] Report สรุปผลรวมของทั้ง 9 accounts
+- [ ] PASS ก็ต่อเมื่อชื่อ account อยู่ใน reservations.php ตอนจบ hold window (§10.10)
+- [ ] Report สรุปผลรวมของทุก account (JSON report + DM ราย user + สรุปให้ owner)
 
 ---
 
 ## 9. สิ่งที่ต้องเติมก่อน implement
 
-> **Action item เดียวที่เหลือ:**
-> ระบุ **slot เวลาของแต่ละ account** ทั้ง 9 คน (แทนที่ "TBD" ใน accounts.json)
-> เช่น "08:00", "09:00", "10:00" ฯลฯ ตามที่ต้องการจอง
+> **ไม่มี action item ค้าง** — slot ของทุก account ระบุแล้วใน `config/users.json` / `config/accounts.json` (รูปแบบ `HH:MM_HH:MM`, ดู §2). ข้อเดิม "ระบุ slot ทั้ง 9 คนแทน TBD" ปิดแล้ว
 
 ---
 
 ## 10. Operational Notes (user-approved divergence from spec)
 
-ข้อต่อไปนี้คือ **deviation** จาก §3.4 / §7 — อนุมัติโดย user แล้ว เพื่อแก้บั๊กที่เจอจริงในวัน 2026-06-30:
+ข้อต่อไปนี้คือ **deviation** จาก spec เดิม (§3–§8) — อนุมัติโดย user แล้วทุกข้อ เพื่อแก้บั๊กที่เจอจริงตั้งแต่ 2026-06-30. เมื่อขัดกับ section ก่อนหน้า ให้ถือ §10 เป็นหลัก:
 
 ### 10.1 Telegram DM delivery — telegraf 4.x outbound hang (fix A)
 
@@ -259,7 +297,7 @@ async function waitUntilNoonThenRun(): Promise<void> {
 - เปลี่ยน priority เป็น **slot-first, court-priority-second**: ทุก account ลอง `COURTS[0]` ก่อนด้วย slot ของตัวเอง → fallback `COURTS[1]` → safety-net (other badminton)
 - **Per-court slot fallback ปิด** — ถ้า slot ตัวเองไม่ว่างใน court นั้น → ข้ามไป court ถัดไป (ไม่ลอง slot อื่นใน court เดียวกัน)
 - Court priority ย้ายจาก hardcode `แบดมินตัน1` → `แบดมินตัน4` เป็น config-driven ที่ top-level `COURT_PRIORITY` ใน `config/accounts.json` (default `["แบดมินตัน2", "แบดมินตัน1"]`)
-- **Deep-prewarm invariant check**: ที่ T-5min ถ้า account ไหรไม่มี (priority + safety-net court) ที่ slot ตัวเองว่างเลย → ABORT prewarm + console error + Telegram DM to owner
+- **Deep-prewarm invariant check**: ที่ T-5min ถ้า account ไหรไม่มี (priority + safety-net court) ที่ slot ตัวเองว่างเลย → ABORT prewarm + console error + Telegram DM to owner *(ยกเลิก 2026-08-22 — ลดเป็น heads-up ที่ไม่เปลี่ยนการยิง ดู §10.11)*
 - Per-account `court` field กลายเป็น `@deprecated` (เก็บไว้เพื่อ backward compat กับ running accounts/users.json ที่อาจยังมี field นี้ — loaders tolerate undefined)
 
 **ไฟล์ที่เปลี่ยน**:
@@ -352,3 +390,27 @@ async function waitUntilNoonThenRun(): Promise<void> {
 **ไฟล์**: `src/wipeGuard.ts` (NEW), `src/bookingFlow.ts`, `src/server/bookingEngine.ts`, `src/server/testLogAudit.ts` (mock: list รวม, 1 แถวต่อ (สนาม, slot) และต่อ user, wipe, outsiders, คิว/ส่งช้า, DB error ต่อสนาม), `package.json`
 
 **ทดสอบ**: `npm run test:wipe` (w-wipe, w-nowipe, w-lost, w-already, w-killswitch) + `npm run test:log-audit` ทั้งชุด
+
+### 10.11 Bot engine as built (2026-08-22 → 08-31)
+
+บันทึกย้อนหลังของการเปลี่ยนแปลงที่ตกลงกันจาก audit 2026-08-22 และรอบเที่ยงแรก ๆ — ก่อนหน้านี้มีแค่ใน commit message
+
+**Single-batch engine + prewarm states** (`ed7357b`, 2026-08-22):
+- batch เดียวสำหรับทุก user: browser เดียว, context ใหม่ต่อ account, `Promise.all` ครั้งเดียวที่ tick (engine แยกต่อ user เดิมทำให้ user ที่สองช้ากว่า 45–280ms); DM ราย user ทันทีที่ account ของ user นั้นจบ แล้วสรุปให้ owner
+- สถานะ prewarm ต่อ account: `page-ready` (login + เลือกสนาม/slot แล้ว → POST ทันทีตอน T) / `login-ready` (dropdown 11:55 ยังเป็นข้อมูลเมื่อวานจนเลือกไม่ได้ → ตอน T ใส่ id สนามจาก `config/court-ids.json` แล้ว POST, ไม่มี id → reload 1 ครั้ง) / `needs-standard` (login แล้วไป reservations.php = จองไว้แล้ว) / `failed` (retry ทุก 30s ถึง T-40s, ที่เหลือ login ใหม่ตอน T)
+- Deep-prewarm invariant (§10.4) **ลดเป็น heads-up DM** — อ่านจากข้อมูลก่อน reset จึงไม่เปลี่ยนการยิง
+- `SUBMIT_VIA=fetch` (default): serialize ฟอร์มจริงแล้ว POST ด้วย `fetch()` ในหน้า (~50ms, ไม่ navigate); `SUBMIT_VIA=click` = rollback
+- `DEEP_PREWARM=0` เป็น kill-switch จริง (standard อย่างเดียว); โหมด shallow prewarm ถูกตัด
+- ปิด context/browser แบบ detached พร้อม log เวลา (teardown เคยกิน ~11 นาทีก่อนส่ง DM)
+
+**Strict PASS + non-blocking submit** (`efea93f`, 2026-08-22): PASS ต้องเจอ row ของ username ตัวเองใน reservations.php (marker เดิมตรงกับหน้าฟอร์มว่าง → false PASS 5 บัญชี); ข้อความ alert ถูกเก็บเข้า `fail_reason`
+
+**Same-slot de-confliction** (`d76adca`, 2026-08-23): รอบเที่ยงแรกทุก account ที่ slot เดียวกันยิงสนามเดียวกัน — 10/17 POST แรกแข่งกันเอง และ server เก็บแถวซ้ำแบบสุ่ม. แก้: หมุนลำดับ `COURT_PRIORITY` ตามตำแหน่งในกลุ่ม slot (§3.4) ใช้ทั้ง prewarm, ตอน T (page-ready ที่ถูกบังคับไปสนามอื่นจะ retarget กลับสนามของตัวเองด้วย cached id), retry loop และ `runStandard`
+
+**Bounded prewarm rounds + outage DM ตามนาฬิกา** (`763f8db`, 2026-08-31): เน็ตล่มทั้งรอบทำ Phase 1 ยาว 10 นาที. แก้: รอบ prewarm มีเพดาน 50% ของเวลาที่เหลือ (ขั้นต่ำ 30s), ปิด context ที่ล้มแบบ detached, DM total outage ตั้ง timer ที่ T-4m (ย้ายไปตั้งก่อน `chromium.launch()` ใน `b373072`, 2026-09-28)
+
+**`users.json` reload** (`95a5c02`, 2026-08-31): bot อ่าน `config/users.json` ใหม่เมื่อ mtime เปลี่ยน — แก้ไฟล์ได้โดยไม่ restart แต่ต้องบันทึกก่อน 11:55; JSON เสียระหว่างรัน → ใช้ cache เดิม
+
+**Court-id cache eviction** (`e392ebd`, 2026-09-28): id ที่เห็นใหม่ไล่ label อื่นที่ถือ id เดียวกันออก; ไม่ inject id ที่ dropdown แสดงอยู่ใต้ label อื่น; `court_booked` อ่านจาก reservations.php
+
+**ไฟล์**: `src/server/bookingEngine.ts`, `src/bookingFlow.ts`, `src/courtIdCache.ts`, `src/server/userStore.ts`, `src/server/bot.ts`

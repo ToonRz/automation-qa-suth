@@ -14,7 +14,7 @@ Playwright-based E2E automation for booking badminton courts on `https://susport
 ## Source of truth
 
 - **`requirements.md`** — full functional spec. Treat it as the contract; this file only summarizes it.
-  - §3.4 (slot-first court selection) and §10 (user-approved operational divergences, 10.1–10.10) **supersede** the older parts of the spec. §2, §4, §5, §7 (`court_attempted` "1 หรือ 4"), §8 and §9 still describe the original 9-account / แบดมินตัน1→4 design — do not implement against those leftovers.
+  - §6.2 is the bot's daily timeline; §10 (user-approved operational divergences, 10.1–10.11) **wins** wherever it conflicts with §3–§8. §10.11 records the 2026-08 engine design (prewarm states, fetch submit, same-slot rotation, heads-up instead of abort).
 - **`config/users.json`** (gitignored; template `config/users.example.json`) — the bot's users: role (`owner`/`friend`), cron on/off, `pending_booking`, and each user's accounts (credentials + slot). Edits are picked up live via mtime reload, but must be saved before the 11:55 cron.
 - **`config/accounts.json`** (gitignored) — top-level `COURT_PRIORITY` (court order for every account; currently 6 courts) + the CLI runner's account list.
 - **`config/court-ids.json`** — cache of court label → dropdown id, refreshed by every dropdown read; used to submit courts missing from the stale pre-noon dropdown.
