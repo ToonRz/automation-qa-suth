@@ -59,8 +59,9 @@ export interface AttemptRecord {
 
 /** How the final status was checked against reservations.php (wipe guard). */
 export interface BookingVerification {
-  /** When the reservations list behind the verdict was requested. */
-  checked_at: string;
+  /** When the reservations list behind the verdict was requested (after the
+   *  hold window); null = it could not be read, the status is unverified. */
+  checked_at: string | null;
   /** Our row in that list, or null. */
   row: { court: string; slot: string; no: string } | null;
   /** When the guard first saw the site wipe the list; null = not seen. */
@@ -977,6 +978,19 @@ async function attemptSubmitBooking(
   slot: string,
   username: string
 ): Promise<AttemptOutcome> {
+  return (
+    (await selectCourtAndSlot(page, court, slot)) ??
+    (await clickSubmitAndClassify(page, court, slot, username))
+  );
+}
+
+/** Click path, step 1: pick the court, wait for its slot list, pick the slot.
+ *  null = ready to click; otherwise why not (nothing was submitted). */
+async function selectCourtAndSlot(
+  page: Page,
+  court: CourtInfo,
+  slot: string
+): Promise<AttemptOutcome | null> {
   const tStart = Date.now();
   try {
     await page.locator('#court').selectOption(court.value, { timeout: 3000 });
@@ -1008,7 +1022,16 @@ async function attemptSubmitBooking(
     return { type: 'submit-fail', reason: 'slot not in dropdown (race?)' };
   }
   console.log(`[perf] attempt court=${court.label} slot=${slot} select_slot=${Date.now() - tSelectSlot}ms`);
+  return null;
+}
 
+/** Click path, step 2: press จอง and classify the answer. */
+async function clickSubmitAndClassify(
+  page: Page,
+  court: CourtInfo,
+  slot: string,
+  username: string
+): Promise<AttemptOutcome> {
   const submitBtn = page
     .locator('button:has-text("จอง"), input[type="submit"][value*="จอง" i]')
     .first();
@@ -1121,16 +1144,24 @@ async function ensureBookingForm(page: Page): Promise<boolean> {
 }
 
 /** One re-book submit inside the hold. No reservations double-check: the hold
- *  reads the whole list again before it submits anything else. */
+ *  reads the whole list again before it submits anything else. null = nothing
+ *  was sent: click mode's page reset or court/slot selection ran past
+ *  `deadline`, so the button was never pressed. */
 async function attemptHoldBooking(
   page: Page,
   court: CourtInfo,
   slot: string,
-  username: string
-): Promise<AttemptOutcome> {
+  username: string,
+  deadline: number
+): Promise<AttemptOutcome | null> {
   if (submitVia() === 'click') {
     await resetToBookingPage(page).catch(() => {});
-    return attemptSubmitBooking(page, court, slot, username);
+    if (Date.now() >= deadline) return null;
+    const notReady = await selectCourtAndSlot(page, court, slot);
+    if (notReady) return notReady;
+    // Selecting waits on the site's slot AJAX — check again right before the click.
+    if (Date.now() >= deadline) return null;
+    return clickSubmitAndClassify(page, court, slot, username);
   }
   return attemptBookingFetch(page, court, slot, username, false, {
     confirm: false,
@@ -1153,8 +1184,10 @@ function holdFailLabel(court: string, reason: string): string {
  * status comes from the list itself: PASS only when our row is in it.
  *
  * Never submits while a list requested after our last answered submit still
- * shows our row, so it cannot stack a second booking on a live one. Mutates
- * `result`; never throws past its caller's catch.
+ * shows our row, so it cannot stack a second booking on a live one. Never
+ * starts a submit once the window has closed — one already in flight may
+ * answer late and is recorded, but nothing new goes out. Mutates `result`;
+ * never throws past its caller's catch.
  */
 async function holdForWipe(
   page: Page,
@@ -1173,17 +1206,17 @@ async function holdForWipe(
     else if (t.outcome === 'submit-fail') guard.noteAttempt(t.court, failKind(t.reason));
   }
 
-  let lastActionEnd = Date.now();
   // Newest list already handled. Every wait must be for a NEWER one: waiting
   // again on the same `after` hands back the same snapshot at once, and that
   // loop never leaves the microtask queue — timers (the hold deadline
   // included) and I/O starve and the whole process hangs.
-  let seenUpTo = lastActionEnd;
+  let seenUpTo = Date.now();
   let submits = 0;
   let wipes = 0;
   let firstWipeSeenAt: number | null = null;
   let serverSaysBooked = false;
   let lastFail: string | null = null;
+  const windowOpen = (): boolean => Date.now() < guard.deadline;
 
   for (;;) {
     const snap = await guard.nextSnapshot(seenUpTo);
@@ -1208,6 +1241,7 @@ async function holdForWipe(
       booked = null;
     }
     if (serverSaysBooked || submits >= HOLD_MAX_SUBMITS) continue;
+    if (!windowOpen()) break; // a list answered after the deadline starts nothing
     const courts = guard.candidatesFor(user, snap);
     if (courts.length === 0) continue; // slot taken everywhere — wait for the list to change
 
@@ -1219,8 +1253,12 @@ async function holdForWipe(
       }
       for (const court of courts) {
         if (submits >= HOLD_MAX_SUBMITS) break;
+        // Checked before EVERY new submit: the previous one (or the page
+        // load above) may have answered after the deadline.
+        if (!windowOpen()) break;
+        const outcome = await attemptHoldBooking(page, court, account.slot, user, guard.deadline);
+        if (!outcome) break;
         submits += 1;
-        const outcome = await attemptHoldBooking(page, court, account.slot, user);
         if (outcome.type === 'success') {
           guard.noteAttempt(court.label, 'success');
           result.attempts.push({ court: court.label, slot: account.slot, outcome: 'success', reason: 'hold' });
@@ -1255,16 +1293,18 @@ async function holdForWipe(
       }
     } finally {
       guard.setBusy(user, false);
-      lastActionEnd = Date.now();
-      seenUpTo = lastActionEnd; // the next list must postdate our submits
+      seenUpTo = Date.now(); // the next list must postdate our submits
     }
   }
 
-  // ---- verdict: the list as it stands now ----
-  const snap = guard.latestAfter(lastActionEnd) ?? (await fetchReservationSnapshot(page));
+  // ---- verdict: a list requested now, after the window closed ----
+  // Never a snapshot the guard took earlier: a row seen at +1.5s can be wiped
+  // at +2s, and if every poll after that failed, the old snapshot would pass
+  // a deleted booking as proof. Bounded by the snapshot's own fetch timeout.
+  const snap = await fetchReservationSnapshot(page);
   const mine = snap?.rows.find((r) => r.user === user) ?? null;
   result.verification = {
-    checked_at: new Date(snap?.issuedAt ?? Date.now()).toISOString(),
+    checked_at: snap ? new Date(snap.issuedAt).toISOString() : null,
     row: mine ? { court: mine.court, slot: mine.slot, no: mine.no } : null,
     wipe_detected_at: guard.wipeAt === null ? null : new Date(guard.wipeAt).toISOString(),
     first_wave_status: firstWave,
@@ -1273,7 +1313,8 @@ async function holdForWipe(
   if (!snap) {
     console.warn(
       `[verify] ${user} reservations.php unreadable at +${guard.since()}ms — ` +
-        `${result.status} left unverified`
+        `${result.status} left unverified (first wave ${firstWave}` +
+        `${wipes ? `, wiped x${wipes}` : ''}${submits ? `, ${submits} hold submit(s)` : ''})`
     );
     return;
   }

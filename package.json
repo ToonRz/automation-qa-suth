@@ -16,7 +16,7 @@
     "bot:test-wizards": "ts-node src/server/testWizardHelpers.ts",
     "test:fast-confirm": "ts-node src/server/testFastConfirm.ts",
     "test:log-audit": "ts-node src/server/testLogAudit.ts",
-    "test:wipe": "ts-node src/server/testLogAudit.ts w-wipe w-nowipe w-lost w-already w-killswitch"
+    "test:wipe": "ts-node src/server/testLogAudit.ts w-wipe w-nowipe w-lost w-already w-stale-verify w-deadline w-click-deadline w-killswitch"
   },
   "dependencies": {
     "dotenv": "^16.4.7",

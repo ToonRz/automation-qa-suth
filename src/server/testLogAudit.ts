@@ -80,7 +80,13 @@ type PostMode = 'ok' | 'hang' | 'hang-books';
 interface MockPlan {
   login: 'ok' | 'hang' | 'reset';
   reservedTimes: 'ok' | 'hang';
+  /** ms before get_reserved_times.php answers a request arriving `at` — the
+   *  click path waits on it while selecting court and slot. */
+  reservedTimesDelayMs: (user: string, at: number) => number;
   reservations: 'ok' | 'hang';
+  /** While true for (user, now), a GET of reservations.php answers 503 with
+   *  no list — the "every poll after the wipe failed" state. */
+  reservationsDown: (user: string, at: number) => boolean;
   /** Outcome of a user's n-th (0-based) book_court.php POST. 'hang-books'
    *  records the booking server-side and then never answers. */
   bookPost: (user: string, n: number) => PostMode;
@@ -132,7 +138,9 @@ class MockSusport {
   plan: MockPlan = {
     login: 'ok',
     reservedTimes: 'ok',
+    reservedTimesDelayMs: () => 0,
     reservations: 'ok',
+    reservationsDown: () => false,
     bookPost: () => 'ok',
     postDelayMs: () => 0,
     respondDelayMs: () => 0,
@@ -254,6 +262,11 @@ class MockSusport {
         if (this.plan.reservedTimes === 'hang') return;
         const court = courtLabelOf(new URLSearchParams(body).get('court_id') ?? '');
         const reserved = this.rows.filter((r) => r.court === court).map((r) => r.slot);
+        const later = this.plan.reservedTimesDelayMs(user, Date.now());
+        if (later > 0) {
+          setTimeout(() => send(200, 'application/json', JSON.stringify(reserved)), later);
+          return;
+        }
         return send(200, 'application/json', JSON.stringify(reserved));
       }
       case '/book_court.php': {
@@ -290,6 +303,9 @@ class MockSusport {
       }
       case '/reservations.php':
         if (this.plan.reservations === 'hang' && method === 'GET') return;
+        if (method === 'GET' && this.plan.reservationsDown(user, Date.now())) {
+          return send(503, 'text/html; charset=utf-8', '<html><body>Service Unavailable</body></html>');
+        }
         return html(this.reservationsHtml());
       default:
         return send(404, 'text/plain', 'not found');
@@ -1291,6 +1307,133 @@ const scenarios: Scenario[] = [
       assert.equal(h.mock.postsBy('mock-u1').length, 2, 'one re-book submit, then stop');
       assert.ok(r.attempts.some((t) => t.reason === 'hold: already-booked'));
       assert.equal(r.verification?.hold_submits, 1);
+    },
+  },
+  {
+    name: 'w-stale-verify',
+    about: 'W: rows listed at +1s, wiped at +2s, every poll after that fails → the verdict comes from a list requested after the window (u1: no row → FAIL), never the pre-wipe snapshot; that list unreadable too (u2) → first wave kept, left unverified (§10.10)',
+    run: async () => {
+      process.env.WIPE_HOLD_SEC = '4';
+      process.env.PREWARM_LEAD_SEC = '55';
+      const target = new Date(Date.now() + 55_000);
+      const T = target.getTime();
+      const holdEnd = T + 4_000;
+      // Down from the wipe until the window closes; for mock-u2 it stays down.
+      h.mock.plan.reservationsDown = (user, at) =>
+        at >= T + WIPE_AFTER_MS && (at < holdEnd || user === 'mock-u2');
+      h.mock.at(T + WIPE_AFTER_MS, () => h.mock.wipe());
+      const { onAccountSettled } = collectSettled();
+      const res = await engine.runPrewarmedBatch(mockAccounts(2), target, { onAccountSettled });
+      const [u1, u2] = res.results;
+
+      const listedBeforeWipe = h.mock.requests.filter(
+        (q) => q.path === '/reservations.php' && q.method === 'GET' && q.at >= T + 1_000 && q.at < T + WIPE_AFTER_MS
+      );
+      assert.ok(listedBeforeWipe.length > 0, 'the guard read the list (both rows) before the wipe');
+      assert.ok(!h.has(/WIPE detected|rows vanished|row gone/), 'no poll after the wipe was readable');
+      for (const r of res.results) {
+        assert.equal(h.mock.rowOf(r.username), undefined, `${r.username}: the site has no row`);
+        assert.equal(h.mock.postsBy(r.username).length, 1, `${r.username}: one POST`);
+        assert.equal(r.verification?.first_wave_status, 'PASS');
+        assert.ok(fs.existsSync(r.screenshot), `${r.username} screenshot`);
+      }
+
+      assert.equal(u1.status, 'FAIL', 'u1: the list after the window has no row');
+      assert.equal(u1.court_booked, null);
+      assert.equal(u1.verification?.row, null);
+      const checkedAt = Date.parse(String(u1.verification?.checked_at));
+      assert.ok(checkedAt >= holdEnd, `u1 verdict list requested at +${checkedAt - T}ms (window closed at +4000ms)`);
+      assert.match(String(u1.fail_reason), /^ไม่พบการจองใน reservations\.php \(ตรวจที่ \+\d+\.\ds\)$/);
+
+      assert.equal(u2.status, 'PASS', 'u2: final list unreadable → first-wave result kept');
+      assert.equal(u2.verification?.checked_at, null, 'u2: nothing checked');
+      assert.equal(u2.verification?.row, null);
+      assert.ok(
+        h.has(/^\[WARN\] \[verify\] mock-u2 reservations\.php unreadable at \+\d+ms — PASS left unverified/),
+        'u2 logged as unverified'
+      );
+    },
+  },
+  {
+    name: 'w-deadline',
+    about: 'W: a re-book sent inside the window answers race-loss after it closed → its answer is kept, but no new submit starts after the deadline; verdict from the list',
+    run: async () => {
+      process.env.WIPE_HOLD_SEC = '4';
+      process.env.PREWARM_LEAD_SEC = '55';
+      const target = new Date(Date.now() + 55_000);
+      const T = target.getTime();
+      const holdEnd = T + 4_000;
+      // The re-book (2nd POST, ~+2.2s) sits in the server queue until ~+4.7s;
+      // by then an outsider holds the slot on every court.
+      h.mock.plan.postDelayMs = (_user, n) => (n === 1 ? 2_500 : 0);
+      h.mock.at(T + WIPE_AFTER_MS, () => h.mock.wipe());
+      h.mock.at(T + 3_000, () => {
+        for (const c of Object.keys(COURT_IDS)) h.mock.outsider(`late-${c}`, c, '18:30_19:30');
+      });
+      const { onAccountSettled } = collectSettled();
+      const res = await engine.runPrewarmedBatch(mockAccounts(1), target, { onAccountSettled });
+      const r = res.results[0];
+
+      assert.ok(h.has(/^\[WARN\] \[wipe\] mock-u1 row gone at \+\d+ms/), 'the hold saw its row wiped');
+      const posts = h.mock.postsBy('mock-u1');
+      assert.equal(posts.length, 2, 'first wave + one re-book — nothing after the deadline');
+      for (const q of posts) {
+        assert.ok(q.at < holdEnd, `POST at +${q.at - T}ms started inside the window`);
+      }
+      const late = r.attempts.filter((t) => t.outcome === 'submit-fail' && /^hold: /.test(t.reason ?? ''));
+      assert.equal(late.length, 1, 'the late race-loss answer is recorded');
+      assert.equal(r.verification?.hold_submits, 1);
+      assert.equal(r.status, 'FAIL');
+      assert.equal(r.court_booked, null);
+      assert.match(
+        String(r.fail_reason),
+        /^การจองถูกเว็บลบหลังเที่ยง \(\+\d+\.\ds\) — จองใหม่ไม่สำเร็จ: แบดมินตัน\d มีคนจองก่อน$/
+      );
+      const checkedAt = Date.parse(String(r.verification?.checked_at));
+      assert.ok(checkedAt >= T + 4_500, `verdict list requested after the late answer (+${checkedAt - T}ms)`);
+    },
+  },
+  {
+    name: 'w-click-deadline',
+    about: 'W (SUBMIT_VIA=click): the re-book starts selecting court/slot inside the window, the slot AJAX answers after it closed → the button is never pressed, nothing counted as a submit; verdict from the list',
+    run: async () => {
+      process.env.SUBMIT_VIA = 'click';
+      try {
+        process.env.WIPE_HOLD_SEC = '4';
+        process.env.PREWARM_LEAD_SEC = '55';
+        const target = new Date(Date.now() + 55_000);
+        const T = target.getTime();
+        const holdEnd = T + 4_000;
+        // From the wipe on, the slot list answers 2.5s late: the re-book that
+        // starts selecting at ~+2.2s is ready to click only at ~+4.7s.
+        h.mock.plan.reservedTimesDelayMs = (_user, at) => (at >= T + WIPE_AFTER_MS ? 2_500 : 0);
+        h.mock.at(T + WIPE_AFTER_MS, () => h.mock.wipe());
+        const { onAccountSettled } = collectSettled();
+        const res = await engine.runPrewarmedBatch(mockAccounts(1), target, { onAccountSettled });
+        const r = res.results[0];
+
+        assert.ok(h.has(/^\[WARN\] \[wipe\] mock-u1 row gone at \+\d+ms/), 'the hold saw its row wiped');
+        const selecting = h.mock.requests.filter(
+          (q) =>
+            q.user === 'mock-u1' &&
+            q.path === '/get_reserved_times.php' &&
+            q.at >= T + WIPE_AFTER_MS &&
+            q.at < holdEnd
+        );
+        assert.ok(selecting.length > 0, 'the re-book started selecting inside the window');
+        const posts = h.mock.postsBy('mock-u1');
+        assert.equal(posts.length, 1, 'first wave only — no click after the deadline');
+        assert.ok(posts[0].at < T + 1_000, 'that one POST is the first wave');
+        assert.equal(r.verification?.hold_submits, 0, 'nothing sent → nothing counted');
+        assert.equal(r.status, 'FAIL');
+        assert.equal(r.court_booked, null);
+        assert.match(String(r.fail_reason), /^การจองถูกเว็บลบหลังเที่ยง \(\+\d+\.\ds\) — จองใหม่ไม่สำเร็จ: /);
+        const checkedAt = Date.parse(String(r.verification?.checked_at));
+        assert.ok(checkedAt >= holdEnd, `verdict list requested after the window (+${checkedAt - T}ms)`);
+        assert.ok(fs.existsSync(r.screenshot), 'screenshot');
+      } finally {
+        delete process.env.SUBMIT_VIA;
+      }
     },
   },
   {
